@@ -1,0 +1,9 @@
+/splice
+/splice.exe
+*.test
+*.out
+coverage.out
+coverage
+dist/
+.splice/
+.DS_Store

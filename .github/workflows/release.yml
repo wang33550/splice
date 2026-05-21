@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build release artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build and package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/pkg
+          targets=(
+            "linux amd64 splice-linux-amd64 splice"
+            "linux arm64 splice-linux-arm64 splice"
+            "darwin amd64 splice-darwin-amd64 splice"
+            "darwin arm64 splice-darwin-arm64 splice"
+            "windows amd64 splice-windows-amd64 splice.exe"
+          )
+          for target in "${targets[@]}"; do
+            read -r goos goarch package binary <<<"$target"
+            work="dist/pkg/$package"
+            mkdir -p "$work"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w" -o "$work/$binary" ./cmd/splice
+            cp README.md LICENSE "$work/"
+            if [[ "$goos" == "windows" ]]; then
+              (cd dist/pkg && zip -q -r "../$package.zip" "$package")
+            else
+              tar -C dist/pkg -czf "dist/$package.tar.gz" "$package"
+            fi
+          done
+          (cd dist && sha256sum *.tar.gz *.zip > checksums.txt)
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
