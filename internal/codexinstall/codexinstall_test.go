@@ -267,12 +267,16 @@ func TestResolvePlanProjectUsesCurrentCwdWhenBlank(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chdir(old) })
+	actualCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	plan, err := ResolvePlan(ScopeProject, "", "/bin/splice", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.ConfigPath != filepath.Join(cwd, ".codex", "config.toml") {
+	if plan.ConfigPath != filepath.Join(actualCwd, ".codex", "config.toml") {
 		t.Fatalf("default project config path = %q", plan.ConfigPath)
 	}
 }

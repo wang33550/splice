@@ -284,12 +284,16 @@ func TestResolvePlanDefaultLocalCwd(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.Chdir(old) })
+	actualCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	plan, err := ResolvePlan(ScopeLocal, "", "/bin/splice", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.SettingsPath != filepath.Join(cwd, ".claude", "settings.local.json") {
+	if plan.SettingsPath != filepath.Join(actualCwd, ".claude", "settings.local.json") {
 		t.Fatalf("default local settings path = %q", plan.SettingsPath)
 	}
 }
