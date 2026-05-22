@@ -1230,6 +1230,37 @@ func TestWatcherHandlersIgnoreMalformedEvents(t *testing.T) {
 	}
 }
 
+func TestApplyEventWrapperRoutesEvents(t *testing.T) {
+	w, err := New("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, err := store.OpenSession("apply-wrapper")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	applyEvent(w, st, "apply-wrapper", mustParseEvent(t,
+		`{"timestamp":"2026-05-19T10:00:00.000Z","type":"response_item","payload":{"type":"function_call","call_id":"c1","name":"shell","arguments":"{\"command\":\"npm test\"}"}}`,
+	))
+	applyEvent(w, st, "apply-wrapper", mustParseEvent(t,
+		`{"timestamp":"2026-05-19T10:00:01.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"c1","output":"ok","exit_code":0}}`,
+	))
+	applyEvent(w, st, "apply-wrapper", mustParseEvent(t,
+		`{"timestamp":"2026-05-19T10:00:02.000Z","type":"context_compaction"}`,
+	))
+
+	_, hash := FingerprintToolCall("shell", `{"command":"npm test"}`)
+	hit, err := st.LookupCachedHit(hash, nil, func(string) bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hit == nil || hit.Entry.Output != "ok" {
+		t.Fatalf("applyEvent wrapper should produce usable frozen hit, got %+v", hit)
+	}
+}
+
 func TestWatcherToolNameForStoreAndLogger(t *testing.T) {
 	if got := toolNameForStore("shell"); got != "Bash" {
 		t.Fatalf("shell canonicalization = %q", got)

@@ -274,6 +274,26 @@ func TestResolvePlanQuotesPathWithSpaces(t *testing.T) {
 	}
 }
 
+func TestResolvePlanDefaultLocalCwd(t *testing.T) {
+	cwd := t.TempDir()
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(cwd); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+
+	plan, err := ResolvePlan(ScopeLocal, "", "/bin/splice", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.SettingsPath != filepath.Join(cwd, ".claude", "settings.local.json") {
+		t.Fatalf("default local settings path = %q", plan.SettingsPath)
+	}
+}
+
 func TestResolvePlanUnknownScopeErrors(t *testing.T) {
 	_, err := ResolvePlan(Scope(99), t.TempDir(), "/bin/splice", nil)
 	if err == nil || !strings.Contains(err.Error(), "unknown scope") {

@@ -1219,6 +1219,31 @@ func TestMalformedConfigFallsBackSafely(t *testing.T) {
 	}
 }
 
+func TestPreCompactRequiresSessionID(t *testing.T) {
+	_, err := runHookForTest(`{"hook_event_name":"PreCompact","cwd":"."}`, runPreCompact)
+	if err == nil || !strings.Contains(err.Error(), "missing session_id") {
+		t.Fatalf("expected missing session_id error, got %v", err)
+	}
+}
+
+func TestPendingIDReadErrors(t *testing.T) {
+	if got, err := readPendingID("missing-session", "hash"); err != nil || got != "" {
+		t.Fatalf("missing pending sidecar should return empty nil, got %q err=%v", got, err)
+	}
+
+	session := "sess-PENDING-READ-ERR"
+	if err := os.MkdirAll(pendingDir(session), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	badPath := filepath.Join(pendingDir(session), "hash-dir")
+	if err := os.MkdirAll(badPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readPendingID(session, "hash-dir"); err == nil {
+		t.Fatal("expected read error when pending id path is a directory")
+	}
+}
+
 func TestRuntimeSnapshotEvictionDropsOldTrailAfterNoHits(t *testing.T) {
 	cwd := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cwd, ".splice"), 0o755); err != nil {

@@ -257,6 +257,26 @@ func TestResolvePlanUserUsesCodexHomeAndPathDetection(t *testing.T) {
 	}
 }
 
+func TestResolvePlanProjectUsesCurrentCwdWhenBlank(t *testing.T) {
+	cwd := t.TempDir()
+	old, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(cwd); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(old) })
+
+	plan, err := ResolvePlan(ScopeProject, "", "/bin/splice", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.ConfigPath != filepath.Join(cwd, ".codex", "config.toml") {
+		t.Fatalf("default project config path = %q", plan.ConfigPath)
+	}
+}
+
 func TestResolvePlanUnknownScopeErrors(t *testing.T) {
 	_, err := ResolvePlan(Scope(99), t.TempDir(), "/bin/splice", nil)
 	if err == nil || !strings.Contains(err.Error(), "unknown scope") {
