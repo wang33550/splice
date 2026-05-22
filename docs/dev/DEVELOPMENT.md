@@ -78,9 +78,10 @@ Before tagging a release:
 6. Run cross-platform build smoke tests.
 7. Install hooks in a disposable project and verify:
    `splice install-claude-hooks --local`.
-8. For Codex, verify hooks plus watcher:
-   `splice install-codex-hooks --project` and `splice codex-watch`.
-9. Confirm `.splice/`, databases, coverage files, and built artifacts are not
+8. For Codex desktop, verify user-wide hooks plus auto-started global watcher:
+   `splice install-codex-hooks --user`, start a Codex session, and inspect
+   `~/.splice/codex-watch.log`. Manual fallback: `splice codex-watch`.
+9. Confirm local `~/.splice/` runtime state, databases, coverage files, and built artifacts are not
    staged.
 10. Tag as `vX.Y.Z` and let the release workflow publish artifacts.
 
@@ -93,8 +94,11 @@ worth running these manually:
   repeat, and confirm ask/deny behavior.
 - Claude Code side-effect fence: run a command, edit a file through the agent,
   compact, repeat, and confirm splice allows re-run.
-- Codex watcher recovery: start `splice codex-watch`, run a session through
-  compaction, and confirm the watcher freezes the trail.
+- Codex watcher recovery: start a Codex session and confirm SessionStart
+  auto-starts the global watcher; run a session through compaction and confirm
+  the watcher freezes the trail. Manual fallback: `splice codex-watch`.
+- Codex rollout lifecycle: while the watcher is running, confirm truncation or
+  replacement of a rollout does not permanently stop that session's protection.
 - `/clear`: trigger clear, repeat an old command, and confirm old results are
   not restored.
 - Long task: start a task that crosses compaction and confirm splice emits
@@ -107,7 +111,7 @@ cmd/splice/                 CLI entry point and hook runtime
 internal/hook/              Claude/Codex hook input and output schema
 internal/fingerprint/       canonical tool args and hashes
 internal/classify/          Bash read-only / side-effect / volatile rules
-internal/store/             per-session SQLite trail store
+internal/store/             global per-session SQLite trail store
 internal/inject/            ask/deny/in-flight context templates
 internal/config/            .splice/config.json loader
 internal/install/           Claude settings.json installer
@@ -119,6 +123,6 @@ docs/dev/archive/           historical bug/debug reports
 
 ## Data And Privacy
 
-Local state under `.splice/` can contain command arguments, command output,
+Local state under `~/.splice/` can contain command arguments, command output,
 tool results, and session identifiers. Do not attach raw databases to public
 issues unless they are sanitized.

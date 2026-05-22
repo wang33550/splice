@@ -111,6 +111,10 @@ func TestApplyIdempotent(t *testing.T) {
 	if len(pre) != 1 || len(post) != 1 || len(ss) != 1 {
 		t.Fatalf("re-install duplicated entries: pre=%d post=%d ss=%d", len(pre), len(post), len(ss))
 	}
+	ssHooks := entryList(t, ss[0]["hooks"])
+	if got, _ := ssHooks[0]["command"].(string); got != "splice codex-session-start" {
+		t.Fatalf("SessionStart should auto-start watcher via codex-session-start, got %q", got)
+	}
 }
 
 func TestUninstallRemovesOnlyOurs(t *testing.T) {

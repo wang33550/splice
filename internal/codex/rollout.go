@@ -14,6 +14,8 @@ package codex
 
 import (
 	"bufio"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -48,12 +50,12 @@ const (
 	KindResponseItem // assistant text / reasoning — not a tool invocation
 )
 
-// SessionMeta is what we read from the first line of a rollout JSONL.
-// At minimum we want cwd so the watcher can decide which sessions belong
-// to the user's current project directory.
+// SessionMeta is what we read from the first line of a rollout JSONL. cwd is
+// routing metadata only; session_id remains the storage ownership key.
 type SessionMeta struct {
-	SessionID string
-	Cwd       string
+	SessionID  string
+	Cwd        string
+	CwdPresent bool
 }
 
 type ToolCall struct {
@@ -99,6 +101,7 @@ func FindRolloutFile(sessionID string) (string, error) {
 		return "", err
 	}
 	var match string
+	var matchMod time.Time
 	err = filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			// skip unreadable subtrees rather than aborting the whole walk
@@ -111,18 +114,22 @@ func FindRolloutFile(sessionID string) (string, error) {
 			return nil
 		}
 		// Codex names files like "rollout-<ts>-<id>.jsonl" or "<id>.jsonl".
-		// Match either by exact id at the end of the basename or by the id
-		// being a substring (covers any future variant).
+		// Exact/suffix matches are trusted. Broader substring matches must
+		// prove the session id from the rollout's own session_meta line so
+		// "sess-1" never attaches to "sess-10".
 		base := strings.TrimSuffix(d.Name(), ".jsonl")
-		if base == sessionID || strings.HasSuffix(base, "-"+sessionID) || strings.Contains(base, sessionID) {
-			match = path
-			return io.EOF // sentinel to stop walk early
+		if rolloutFileMatchesSession(path, base, sessionID) {
+			info, err := d.Info()
+			if err != nil {
+				return nil
+			}
+			if match == "" || info.ModTime().After(matchMod) {
+				match = path
+				matchMod = info.ModTime()
+			}
 		}
 		return nil
 	})
-	if errors.Is(err, io.EOF) {
-		return match, nil
-	}
 	if err != nil {
 		return "", err
 	}
@@ -130,6 +137,43 @@ func FindRolloutFile(sessionID string) (string, error) {
 		return "", os.ErrNotExist
 	}
 	return match, nil
+}
+
+func rolloutFileMatchesSession(path, base, sessionID string) bool {
+	if base == sessionID || strings.HasSuffix(base, "-"+sessionID) {
+		return true
+	}
+	if !strings.Contains(base, sessionID) {
+		return false
+	}
+	id, err := rolloutSessionID(path)
+	return err == nil && id == sessionID
+}
+
+func rolloutSessionID(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	r := bufio.NewReader(f)
+	for i := 0; i < 64; i++ {
+		line, err := r.ReadBytes('\n')
+		if len(line) > 0 {
+			ev, perr := parseLine(line)
+			if perr == nil && ev.Kind == KindSessionMeta && ev.SessionMeta != nil {
+				return ev.SessionMeta.SessionID, nil
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return "", err
+		}
+	}
+	return "", os.ErrNotExist
 }
 
 // ReadAll reads and parses an entire rollout file. Used for replay on
@@ -214,6 +258,38 @@ func ReadFromOffset(path string, byteOffset int64) ([]Event, error) {
 	return parseStream(bufio.NewReader(f))
 }
 
+// CursorHash returns a checksum for the bytes immediately before byteOffset.
+// It is intentionally small and used only as a tail-cursor guard: if the hash
+// changes at a previously stored offset, the rollout file was truncated or
+// replaced and should be replayed from the beginning.
+func CursorHash(path string, byteOffset int64, window int64) (string, error) {
+	if byteOffset <= 0 {
+		return "", nil
+	}
+	if window <= 0 {
+		window = 4096
+	}
+	start := byteOffset - window
+	if start < 0 {
+		start = 0
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return "", err
+	}
+	buf := make([]byte, byteOffset-start)
+	n, err := io.ReadFull(f, buf)
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	sum := sha1.Sum(buf[:n])
+	return hex.EncodeToString(sum[:]), nil
+}
+
 func parseStream(r *bufio.Reader) ([]Event, error) {
 	var events []Event
 	for {
@@ -293,9 +369,14 @@ func parseSessionMeta(m map[string]json.RawMessage) *SessionMeta {
 	if pl, ok := m["payload"]; ok {
 		_ = json.Unmarshal(pl, &payload)
 	}
+	cwd, cwdPresent := jsonStringPresent(m, "cwd")
+	if !cwdPresent {
+		cwd, cwdPresent = jsonStringPresent(payload, "cwd")
+	}
 	return &SessionMeta{
-		SessionID: firstNonEmpty(jsonString(m, "session_id"), jsonString(payload, "session_id"), jsonString(payload, "id")),
-		Cwd:       firstNonEmpty(jsonString(m, "cwd"), jsonString(payload, "cwd")),
+		SessionID:  firstNonEmpty(jsonString(m, "session_id"), jsonString(payload, "session_id"), jsonString(payload, "id")),
+		Cwd:        cwd,
+		CwdPresent: cwdPresent,
 	}
 }
 
@@ -353,6 +434,11 @@ func classifyStatus(payload map[string]json.RawMessage, exitCode *int) string {
 // ----------------------------------------------------------------------
 
 func jsonString(m map[string]json.RawMessage, keys ...string) string {
+	s, _ := jsonStringPresent(m, keys...)
+	return s
+}
+
+func jsonStringPresent(m map[string]json.RawMessage, keys ...string) (string, bool) {
 	for _, k := range keys {
 		raw, ok := m[k]
 		if !ok || len(raw) == 0 {
@@ -360,14 +446,17 @@ func jsonString(m map[string]json.RawMessage, keys ...string) string {
 		}
 		var s string
 		if err := json.Unmarshal(raw, &s); err == nil && s != "" {
-			return s
+			return s, true
+		}
+		if err := json.Unmarshal(raw, &s); err == nil {
+			return s, true
 		}
 		// Some payloads use raw JSON object as the args; serialize it back.
 		if raw[0] == '{' || raw[0] == '[' {
-			return string(raw)
+			return string(raw), true
 		}
 	}
-	return ""
+	return "", false
 }
 
 func jsonBool(m map[string]json.RawMessage, keys ...string) bool {

@@ -1,6 +1,12 @@
-// Package store persists splice's per-session trail. Each conversation
-// gets its own SQLite database under <cwd>/.splice/sessions/<sid>.db so
-// that:
+// Package store persists splice's per-session trail. Runtime state is kept
+// under a user-global splice home, keyed by conversation/session:
+//
+//	$SPLICE_HOME/sessions/<sid>.db
+//	~/.splice/sessions/<sid>.db
+//
+// Project cwd is recorded as routing metadata by higher layers; it is not the
+// ownership key for the database. Each conversation gets its own SQLite
+// database so that:
 //
 //   - rollback / cleanup is a single file delete (e.g. on /clear)
 //   - no row carries a session_id discriminator — the file IS the scope
@@ -27,13 +33,20 @@
 package store
 
 import (
+	"crypto/sha1"
 	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"time"
+
+	"github.com/wang33550/splice/internal/classify"
 
 	_ "modernc.org/sqlite"
 )
@@ -113,39 +126,88 @@ const (
 // Store is a handle to one session's SQLite file. Open with OpenSession.
 type Store struct {
 	db   *sql.DB
-	path string // <cwd>/.splice/sessions/<sid>.db
+	path string // <splice-home>/sessions/<sid>.db
 }
 
-// SessionsDir returns <cwd>/.splice/sessions, creating it if needed.
-func SessionsDir(cwd string) string {
-	return filepath.Join(cwd, ".splice", "sessions")
+// HomeDir returns splice's user-global runtime directory. Tests and advanced
+// users can override it with SPLICE_HOME; otherwise it defaults to ~/.splice.
+func HomeDir() string {
+	if v := strings.TrimSpace(os.Getenv("SPLICE_HOME")); v != "" {
+		return filepath.Clean(v)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return filepath.Clean(".splice")
+	}
+	return filepath.Join(home, ".splice")
+}
+
+// ProjectKey returns the stable global bucket for cwd. cwd is routing metadata,
+// not the database discriminator inside a bucket: each session still gets its
+// own DB file. Blank cwd values represent desktop or host-level conversations
+// not associated with a project directory.
+func ProjectKey(cwd string) string {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return "_projectless"
+	}
+	abs, err := filepath.Abs(cwd)
+	if err == nil {
+		cwd = abs
+	}
+	cwd = filepath.Clean(cwd)
+	norm := filepath.ToSlash(cwd)
+	if runtime.GOOS == "windows" {
+		norm = strings.ToLower(norm)
+	}
+	sum := sha1.Sum([]byte(norm))
+	base := sanitizePathPart(filepath.Base(cwd))
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		base = "project"
+	}
+	return base + "-" + hex.EncodeToString(sum[:6])
+}
+
+// ActiveSessionsDir returns the global marker directory used by SessionStart
+// hooks and the Codex watcher. Markers are global because Codex desktop can
+// switch projects and create sessions without a user-run project-local command.
+func ActiveSessionsDir() string {
+	return filepath.Join(HomeDir(), "active-sessions")
+}
+
+// WatcherLockPath returns the single-user global Codex watcher lock path.
+func WatcherLockPath() string {
+	return filepath.Join(HomeDir(), "codex-watch.lock")
+}
+
+// SessionsDir returns the global session DB directory. session_id is the
+// storage ownership key; cwd/project state is metadata only.
+func SessionsDir() string {
+	return filepath.Join(HomeDir(), "sessions")
 }
 
 // SessionDBPath returns the .db path for a given session.
-func SessionDBPath(cwd, sessionID string) string {
-	return filepath.Join(SessionsDir(cwd), sessionID+".db")
+func SessionDBPath(sessionID string) string {
+	return filepath.Join(SessionsDir(), SessionFileBase(sessionID)+".db")
 }
 
 // SessionMetaPath returns the side-car JSON metadata path for a session.
 // (Stored separately from the .db so external tools / future watchers
 // can read it without opening SQLite.)
-func SessionMetaPath(cwd, sessionID string) string {
-	return filepath.Join(SessionsDir(cwd), sessionID+".meta.json")
+func SessionMetaPath(sessionID string) string {
+	return filepath.Join(SessionsDir(), SessionFileBase(sessionID)+".meta.json")
 }
 
 // OpenSession opens (or creates) the per-session DB.
-func OpenSession(cwd, sessionID string) (*Store, error) {
-	if cwd == "" {
-		return nil, errors.New("store: empty cwd")
-	}
+func OpenSession(sessionID string) (*Store, error) {
 	if sessionID == "" {
 		return nil, errors.New("store: empty session id")
 	}
-	dir := SessionsDir(cwd)
+	dir := SessionsDir()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("store: mkdir sessions: %w", err)
 	}
-	path := SessionDBPath(cwd, sessionID)
+	path := SessionDBPath(sessionID)
 	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -167,6 +229,78 @@ func OpenSession(cwd, sessionID string) (*Store, error) {
 		return nil, fmt.Errorf("store: write schema_meta: %w", err)
 	}
 	return &Store{db: db, path: path}, nil
+}
+
+// SessionMeta is a lightweight sidecar for debugging and watcher routing. The
+// SQLite DB is still scoped only by session_id; cwd/project_key are metadata.
+type SessionMeta struct {
+	SessionID  string `json:"session_id"`
+	Cwd        string `json:"cwd"`
+	ProjectKey string `json:"project_key"`
+	UpdatedAt  string `json:"updated_at"`
+}
+
+// WriteSessionMeta records the latest project metadata for a session without
+// opening SQLite. It is best-effort at call sites because hooks must not fail
+// tool execution just because metadata cannot be written.
+func WriteSessionMeta(cwd, sessionID string) error {
+	if sessionID == "" {
+		return errors.New("store: empty session id")
+	}
+	dir := SessionsDir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	m := SessionMeta{
+		SessionID:  sessionID,
+		Cwd:        cwd,
+		ProjectKey: ProjectKey(cwd),
+		UpdatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := SessionMetaPath(sessionID) + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, SessionMetaPath(sessionID))
+}
+
+func SessionFileBase(sessionID string) string {
+	safe := sanitizePathPart(sessionID)
+	if safe == sessionID && safe != "" {
+		return safe
+	}
+	sum := sha1.Sum([]byte(sessionID))
+	if safe == "" {
+		return "session-" + hex.EncodeToString(sum[:8])
+	}
+	return safe + "-" + hex.EncodeToString(sum[:6])
+}
+
+func sanitizePathPart(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	out := strings.Trim(b.String(), ". ")
+	if out == "." || out == ".." {
+		return ""
+	}
+	return out
 }
 
 func migrateSchema(db *sql.DB) error {
@@ -211,12 +345,55 @@ func (s *Store) Path() string { return s.path }
 // Close releases the SQLite handle.
 func (s *Store) Close() error { return s.db.Close() }
 
-// Drop closes and deletes this session's files. Idempotent.
-// Used on /clear and when a session's rollout has been deleted by the
-// user (GC). Removes the .db, the WAL/SHM sidecars, and meta.json.
+// Drop closes and deletes this session's files. Idempotent. Intended for
+// explicit cleanup/GC paths, not normal /clear handling where another watcher
+// may hold the DB open. Removes the .db, the WAL/SHM sidecars, and meta.json.
 func (s *Store) Drop() error {
 	_ = s.db.Close()
 	return DropSessionFiles(s.path)
+}
+
+// ClearTrailState clears all runtime trail state while keeping the DB file and
+// schema alive. This is safer than deleting the file while a global watcher may
+// have another SQLite handle open for the same session.
+func (s *Store) ClearTrailState() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, stmt := range []string{
+		`DELETE FROM live_trail`,
+		`DELETE FROM pre_compact_trail`,
+		`DELETE FROM cooldown`,
+		`DELETE FROM meta`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// ClearLiveTrailForRolloutReset clears only post-compaction live watcher state
+// and the associated offset cursor. It intentionally keeps the last frozen
+// snapshot: a rollout truncation/replacement is a file lifecycle event, not a
+// user memory boundary like /clear.
+func (s *Store) ClearLiveTrailForRolloutReset() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, stmt := range []string{
+		`DELETE FROM live_trail`,
+		`DELETE FROM meta WHERE key IN ('` + lastOffsetKey + `', '` + lastCursorHashKey + `')`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // DropSessionFiles deletes the .db, its WAL/SHM siblings, and the meta
@@ -914,16 +1091,19 @@ func (s *Store) eventsAfterInLiveTrail(afterSeq int64) ([]TrailEntry, error) {
 	return out, rows.Err()
 }
 
-// isFenceTool returns true for tools whose presence after P
-// unconditionally invalidates the cached result. Bash is intentionally
-// not in this list — it needs command-level classification, see the
-// fenceBashFn callback used by LookupCachedHit.
+// isFenceTool returns true for non-Bash tools whose presence after P
+// invalidates the cached result. Bash is intentionally delegated to
+// command-level classification through the fenceBashFn callback used by
+// LookupCachedHit.
+//
+// Unknown host/MCP tools default to side-effect fences. That is conservative:
+// a false fence only causes duplicated work, while a missed fence can reuse a
+// result after an unobserved mutation.
 func isFenceTool(toolName string) bool {
-	switch toolName {
-	case "Edit", "Write", "NotebookEdit":
-		return true
+	if toolName == "Bash" {
+		return false
 	}
-	return false
+	return classify.ClassifyTool(toolName) == classify.PolicySideEffect
 }
 
 // IsCacheable reports whether a tool's prior result can be safely
@@ -1022,6 +1202,7 @@ func (s *Store) DropSnapshot() error {
 // ----------------------------------------------------------------------
 
 const lastOffsetKey = "rollout_last_offset"
+const lastCursorHashKey = "rollout_last_cursor_hash"
 
 // LastRolloutOffset returns the last offset the watcher persisted, or
 // 0 if none. Used to resume tailing across watcher restarts without
@@ -1042,6 +1223,21 @@ func (s *Store) LastRolloutOffset() (int64, error) {
 	return n, nil
 }
 
+// LastRolloutCursorHash returns the checksum of bytes immediately before the
+// persisted rollout offset. Watchers use it to distinguish normal append from
+// a rollout file replacement that happens to be larger than the old offset.
+func (s *Store) LastRolloutCursorHash() (string, error) {
+	var v string
+	err := s.db.QueryRow(`SELECT value FROM meta WHERE key = ?`, lastCursorHashKey).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return v, nil
+}
+
 // SetLastRolloutOffset persists the watcher's current rollout file
 // offset so a restart can resume without reprocessing.
 func (s *Store) SetLastRolloutOffset(off int64) error {
@@ -1050,6 +1246,29 @@ func (s *Store) SetLastRolloutOffset(off int64) error {
 		lastOffsetKey, strconv.FormatInt(off, 10),
 	)
 	return err
+}
+
+// SetRolloutCursor persists the watcher's current rollout file offset plus a
+// checksum for the bytes immediately before that offset.
+func (s *Store) SetRolloutCursor(off int64, cursorHash string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(
+		`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`,
+		lastOffsetKey, strconv.FormatInt(off, 10),
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)`,
+		lastCursorHashKey, cursorHash,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ----------------------------------------------------------------------

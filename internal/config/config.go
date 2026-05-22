@@ -1,6 +1,7 @@
 // Package config reads splice's user-facing settings from
-// <cwd>/.splice/config.json (project-local) or, if missing, from
-// $HOME/.splice/config.json (global). Defaults apply when both are absent.
+// $HOME/.splice/config.json (global), then overlays
+// <cwd>/.splice/config.json (project-local) when cwd is known. Defaults apply
+// when both are absent.
 package config
 
 import (
@@ -39,7 +40,8 @@ type Resolved struct {
 	NeverCacheBashPatterns []string
 }
 
-// Load reads project-local first, then user-global, then applies defaults.
+// Load reads user-global config first, overlays project-local config when cwd is
+// known, then applies defaults.
 // Errors only on malformed JSON — missing files are silently treated as empty.
 func Load(cwd string) (Resolved, error) {
 	merged := Config{}

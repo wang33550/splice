@@ -87,6 +87,17 @@ func TestFingerprintEmptyArgsAndNonShellTool(t *testing.T) {
 	}
 }
 
+func TestFingerprintToolCallScopedSeparatesProjects(t *testing.T) {
+	canonical, h1 := FingerprintToolCallScoped("shell", `{"command":"npm test"}`, "project-a")
+	_, h2 := FingerprintToolCallScoped("shell", `{"command":"npm test"}`, "project-b")
+	if h1 == h2 {
+		t.Fatal("Codex rollout hashes must include execution scope")
+	}
+	if !strings.Contains(canonical, `"scope":"project-a"`) {
+		t.Fatalf("canonical scope missing: %s", canonical)
+	}
+}
+
 func TestLabelFromToolCallFilePathAndMapFallback(t *testing.T) {
 	if got := LabelFromToolCall("Read", `{"file_path":"/tmp/a.go"}`); got != "/tmp/a.go" {
 		t.Fatalf("file_path label = %q", got)

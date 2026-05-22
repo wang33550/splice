@@ -21,9 +21,16 @@ import (
 // "shell" (Codex name) is folded to "Bash" (Claude name) so the same
 // `npm test` invocation hashes the same on both hosts.
 func FingerprintToolCall(toolName, argsJSON string) (canonical, hexHash string) {
+	return FingerprintToolCallScoped(toolName, argsJSON, "")
+}
+
+// FingerprintToolCallScoped is FingerprintToolCall plus an execution scope,
+// usually store.ProjectKey(cwd). Codex rollout events do not repeat cwd on
+// every tool call, so the watcher supplies it from session metadata.
+func FingerprintToolCallScoped(toolName, argsJSON, scope string) (canonical, hexHash string) {
 	args := decodeArgs(argsJSON)
 	canonName := canonicalToolName(toolName)
-	canonical, hash, err := fingerprint.Compute(canonName, args)
+	canonical, hash, err := fingerprint.ComputeScoped(canonName, args, scope)
 	if err != nil {
 		// fingerprint.Compute only fails on JSON marshal errors of bizarre
 		// inputs (NaN, Inf, channels). For Codex-sourced data this should

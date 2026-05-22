@@ -17,7 +17,8 @@ import (
 	"github.com/wang33550/splice/internal/store"
 )
 
-// MarkerInfo is what the SessionStart hook drops into <cwd>/.splice/active-sessions/.
+// MarkerInfo is what the SessionStart hook drops into the global
+// ~/.splice/active-sessions directory.
 // We re-declare the JSON shape here to avoid an import cycle with cmd/splice.
 type MarkerInfo struct {
 	SessionID      string `json:"session_id"`
@@ -27,11 +28,10 @@ type MarkerInfo struct {
 	UpdatedAt      string `json:"updated_at"`
 }
 
-// Watcher tails Codex rollout JSONL files for every active session in a cwd
+// Watcher tails Codex rollout JSONL files for every globally active session
 // and replays compaction events into splice's per-session stores, providing
 // the same PreCompact-driven trail mechanism that Claude Code natively offers.
 type Watcher struct {
-	Cwd          string
 	PollInterval time.Duration
 	Logger       func(format string, args ...any)
 
@@ -45,14 +45,13 @@ type Watcher struct {
 	pending   map[string]map[string]*pendingCall // session_id -> call_id -> pending
 }
 
-// New constructs a Watcher with sensible defaults. Caller should call
-// Run(ctx) which blocks until ctx is canceled.
-func New(cwd string) (*Watcher, error) {
-	if cwd == "" {
-		return nil, errors.New("watcher: cwd is required")
-	}
+const orphanMarkerTTL = 24 * time.Hour
+
+// New constructs a global Watcher with sensible defaults. The cwd argument is
+// accepted for API compatibility but no longer scopes the watcher; project
+// routing comes from each session marker's cwd metadata.
+func New(_ string) (*Watcher, error) {
 	return &Watcher{
-		Cwd:          cwd,
 		PollInterval: 1 * time.Second,
 		Logger:       func(string, ...any) {},
 		sessions:     map[string]*sessionTail{},
@@ -64,13 +63,12 @@ func New(cwd string) (*Watcher, error) {
 // and closed when those goroutines exit.
 func (w *Watcher) Close() error { return nil }
 
-// Run blocks until ctx is canceled. It periodically scans the marker
-// directory for new active sessions and starts/stops tail goroutines
-// accordingly.
+// Run blocks until ctx is canceled. It periodically scans the global marker
+// directory for new active sessions and starts/stops tail goroutines.
 //
-// Run also acquires a per-cwd lock file at <cwd>/.splice/codex-watch.lock so
-// two concurrent watchers on the same workspace don't both ingest the same
-// rollout events. Returns ErrLocked when another watcher already holds it.
+// Run also acquires a user-global lock file so two concurrent watchers don't
+// both ingest the same rollout events. Returns ErrLocked when another watcher
+// already holds it.
 func (w *Watcher) Run(ctx context.Context) error {
 	released, err := w.acquireLock()
 	if err != nil {
@@ -78,7 +76,7 @@ func (w *Watcher) Run(ctx context.Context) error {
 	}
 	defer released()
 
-	w.Logger("splice codex-watch: starting in %s", w.Cwd)
+	w.Logger("splice codex-watch: starting globally in %s", store.HomeDir())
 	defer w.Logger("splice codex-watch: stopped")
 
 	t := time.NewTicker(w.PollInterval)
@@ -97,19 +95,19 @@ func (w *Watcher) Run(ctx context.Context) error {
 }
 
 // ErrLocked is returned by Run when another watcher process is already
-// active for this workspace. The caller is expected to surface this
+// active for this user. The caller is expected to surface this
 // distinctly so the user knows they don't need a second watcher.
-var ErrLocked = errors.New("watcher: another splice codex-watch is already running for this cwd")
+var ErrLocked = errors.New("watcher: another splice codex-watch is already running")
 
-// acquireLock writes <cwd>/.splice/codex-watch.lock with our PID. If a lock
-// file already exists and the recorded PID is still running, returns
-// ErrLocked. Stale locks (from crashed processes) are reclaimed.
+// acquireLock writes the global codex-watch.lock with our PID. If a lock file
+// already exists and the recorded PID is still running, returns ErrLocked.
+// Stale locks (from crashed processes) are reclaimed.
 func (w *Watcher) acquireLock() (release func(), err error) {
-	dir := filepath.Join(w.Cwd, ".splice")
+	dir := store.HomeDir()
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("watcher: mkdir splice dir: %w", err)
 	}
-	lockPath := filepath.Join(dir, "codex-watch.lock")
+	lockPath := store.WatcherLockPath()
 
 	if existing, err := os.ReadFile(lockPath); err == nil {
 		pidStr := strings.TrimSpace(string(existing))
@@ -133,7 +131,7 @@ func (w *Watcher) acquireLock() (release func(), err error) {
 // process_windows.go.
 
 func (w *Watcher) refresh(ctx context.Context) {
-	markers, err := readMarkers(w.Cwd)
+	markers, err := readMarkers()
 	if err != nil {
 		w.Logger("splice codex-watch: read markers: %v", err)
 		return
@@ -144,20 +142,47 @@ func (w *Watcher) refresh(ctx context.Context) {
 	seen := map[string]struct{}{}
 	for _, m := range markers {
 		seen[m.SessionID] = struct{}{}
-		if _, exists := w.sessions[m.SessionID]; exists {
-			continue
+		rolloutPath := ""
+		if existing, exists := w.sessions[m.SessionID]; exists {
+			if tailDone(existing) {
+				delete(w.sessions, m.SessionID)
+				w.dropSessionPending(m.SessionID)
+				w.Logger("splice codex-watch: session %s tail stopped, restarting", m.SessionID)
+			} else if existing.marker.UpdatedAt == m.UpdatedAt && existing.marker.Cwd == m.Cwd && existing.marker.Source == m.Source {
+				var err error
+				rolloutPath, err = FindRolloutFile(m.SessionID)
+				if err != nil || rolloutPath == existing.path {
+					continue
+				}
+				w.Logger("splice codex-watch: session %s rollout changed, restarting tail", m.SessionID)
+				existing.cancel()
+				waitTailDone(existing)
+				delete(w.sessions, m.SessionID)
+				w.dropSessionPending(m.SessionID)
+			} else {
+				existing.cancel()
+				waitTailDone(existing)
+				delete(w.sessions, m.SessionID)
+				w.dropSessionPending(m.SessionID)
+			}
 		}
 		// New active session — find its rollout file and start tailing.
-		rolloutPath, err := FindRolloutFile(m.SessionID)
-		if err != nil {
-			// Codex may not have flushed the rollout file yet on a brand-new
-			// session. We'll retry on the next refresh cycle.
-			w.Logger("splice codex-watch: rollout for %s not found yet: %v", m.SessionID, err)
-			continue
+		if rolloutPath == "" {
+			var err error
+			rolloutPath, err = FindRolloutFile(m.SessionID)
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) && w.removeStaleOrphanMarker(m) {
+					continue
+				}
+				// Codex may not have flushed the rollout file yet on a brand-new
+				// session. We'll retry on the next refresh cycle.
+				w.Logger("splice codex-watch: rollout for %s not found yet: %v", m.SessionID, err)
+				continue
+			}
 		}
-		ts := startTail(ctx, w, m.SessionID, rolloutPath)
+		ts := startTail(ctx, w, m, rolloutPath)
 		w.sessions[m.SessionID] = ts
-		w.Logger("splice codex-watch: tailing %s -> %s", m.SessionID, rolloutPath)
+		w.Logger("splice codex-watch: tailing %s [%s] -> %s", m.SessionID, store.ProjectKey(m.Cwd), rolloutPath)
 	}
 	// Sessions whose markers are gone — codex exited cleanly. Stop their tails.
 	for id, ts := range w.sessions {
@@ -172,6 +197,34 @@ func (w *Watcher) refresh(ctx context.Context) {
 	}
 }
 
+func tailDone(ts *sessionTail) bool {
+	select {
+	case <-ts.done:
+		return true
+	default:
+		return false
+	}
+}
+
+func (w *Watcher) removeStaleOrphanMarker(m MarkerInfo) bool {
+	updatedAt, err := time.Parse(time.RFC3339Nano, m.UpdatedAt)
+	if err != nil {
+		return false
+	}
+	if time.Since(updatedAt) < orphanMarkerTTL {
+		return false
+	}
+	markerPath := filepath.Join(store.ActiveSessionsDir(), store.SessionFileBase(m.SessionID)+".json")
+	if err := os.Remove(markerPath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			w.Logger("splice codex-watch: remove stale marker %s: %v", m.SessionID, err)
+		}
+		return false
+	}
+	w.Logger("splice codex-watch: removed stale marker %s (no rollout file)", m.SessionID)
+	return true
+}
+
 func (w *Watcher) shutdownAll() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -183,11 +236,11 @@ func (w *Watcher) shutdownAll() {
 	w.dropAllPending()
 }
 
-// readMarkers loads every <cwd>/.splice/active-sessions/*.json marker. We
+// readMarkers loads every global active-sessions/*.json marker. We
 // tolerate broken/empty files (skip them silently) so a half-written marker
 // from a still-running hook doesn't take the watcher down.
-func readMarkers(cwd string) ([]MarkerInfo, error) {
-	dir := filepath.Join(cwd, ".splice", "active-sessions")
+func readMarkers() ([]MarkerInfo, error) {
+	dir := store.ActiveSessionsDir()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -223,22 +276,24 @@ func readMarkers(cwd string) ([]MarkerInfo, error) {
 type sessionTail struct {
 	cancel context.CancelFunc
 	done   chan struct{}
+	marker MarkerInfo
+	path   string
 }
 
 // startTail launches a goroutine that owns one session's store and tails
 // the rollout file. The goroutine resumes from the last persisted offset
 // (so a watcher restart skips already-applied events), then follows the
 // file for new lines.
-func startTail(parent context.Context, w *Watcher, sessionID, path string) *sessionTail {
+func startTail(parent context.Context, w *Watcher, marker MarkerInfo, path string) *sessionTail {
 	ctx, cancel := context.WithCancel(parent)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if err := tailLoop(ctx, w, sessionID, path); err != nil && !errors.Is(err, context.Canceled) {
-			w.Logger("splice codex-watch: %s tail error: %v", sessionID, err)
+		if err := tailLoop(ctx, w, marker, path); err != nil && !errors.Is(err, context.Canceled) {
+			w.Logger("splice codex-watch: %s tail error: %v", marker.SessionID, err)
 		}
 	}()
-	return &sessionTail{cancel: cancel, done: done}
+	return &sessionTail{cancel: cancel, done: done, marker: marker, path: path}
 }
 
 func waitTailDone(ts *sessionTail) {
@@ -248,8 +303,8 @@ func waitTailDone(ts *sessionTail) {
 	}
 }
 
-func tailLoop(ctx context.Context, w *Watcher, sessionID, path string) error {
-	st, err := store.OpenSession(w.Cwd, sessionID)
+func tailLoop(ctx context.Context, w *Watcher, marker MarkerInfo, path string) error {
+	st, err := store.OpenSession(marker.SessionID)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
@@ -262,6 +317,11 @@ func tailLoop(ctx context.Context, w *Watcher, sessionID, path string) error {
 	if err != nil {
 		return fmt.Errorf("read offset: %w", err)
 	}
+	currentSize, err := fileSize(path)
+	if err != nil {
+		return err
+	}
+	startOffset, currentSize = w.reconcileRolloutCursor(st, marker.SessionID, path, startOffset, currentSize)
 
 	// Initial replay from startOffset to current EOF.
 	var initial []Event
@@ -273,14 +333,15 @@ func tailLoop(ctx context.Context, w *Watcher, sessionID, path string) error {
 	if err != nil {
 		return fmt.Errorf("replay: %w", err)
 	}
+	scope := store.ProjectKey(marker.Cwd)
 	for _, ev := range initial {
-		applyEvent(w, st, sessionID, ev)
+		scope = applyEventScoped(w, st, marker.SessionID, scope, ev)
 	}
 	currentOffset, err := fileSize(path)
 	if err != nil {
 		return err
 	}
-	if err := st.SetLastRolloutOffset(currentOffset); err != nil {
+	if err := persistRolloutCursor(st, path, currentOffset); err != nil {
 		w.Logger("splice codex-watch: persist offset: %v", err)
 	}
 
@@ -295,6 +356,7 @@ func tailLoop(ctx context.Context, w *Watcher, sessionID, path string) error {
 			if err != nil {
 				return err
 			}
+			currentOffset, size = w.reconcileRolloutCursor(st, marker.SessionID, path, currentOffset, size)
 			if size <= currentOffset {
 				continue
 			}
@@ -303,14 +365,55 @@ func tailLoop(ctx context.Context, w *Watcher, sessionID, path string) error {
 				return err
 			}
 			for _, ev := range newEvents {
-				applyEvent(w, st, sessionID, ev)
+				scope = applyEventScoped(w, st, marker.SessionID, scope, ev)
 			}
 			currentOffset = size
-			if err := st.SetLastRolloutOffset(currentOffset); err != nil {
+			if err := persistRolloutCursor(st, path, currentOffset); err != nil {
 				w.Logger("splice codex-watch: persist offset: %v", err)
 			}
 		}
 	}
+}
+
+func (w *Watcher) reconcileRolloutCursor(st *store.Store, sessionID, path string, offset, size int64) (int64, int64) {
+	if offset == 0 {
+		return offset, size
+	}
+	storedHash, err := st.LastRolloutCursorHash()
+	if err != nil {
+		w.Logger("splice codex-watch: read cursor hash: %v", err)
+	}
+	currentHash := ""
+	if err == nil && storedHash != "" && offset <= size {
+		currentHash, err = CursorHash(path, offset, rolloutCursorWindow)
+		if err != nil {
+			w.Logger("splice codex-watch: read cursor bytes: %v", err)
+		}
+	}
+	if offset > size || (storedHash != "" && currentHash != "" && storedHash != currentHash) {
+		reason := fmt.Sprintf("offset %d beyond file size %d", offset, size)
+		if offset <= size {
+			reason = fmt.Sprintf("cursor hash changed at offset %d", offset)
+		}
+		w.Logger("splice codex-watch: %s rollout %s; replaying from start", sessionID, reason)
+		w.dropSessionPending(sessionID)
+		offset = 0
+		if err := st.ClearLiveTrailForRolloutReset(); err != nil {
+			w.Logger("splice codex-watch: persist offset reset: %v", err)
+		}
+		size, _ = fileSize(path)
+	}
+	return offset, size
+}
+
+const rolloutCursorWindow = 4096
+
+func persistRolloutCursor(st *store.Store, path string, offset int64) error {
+	hash, err := CursorHash(path, offset, rolloutCursorWindow)
+	if err != nil {
+		return err
+	}
+	return st.SetRolloutCursor(offset, hash)
 }
 
 func fileSize(path string) (int64, error) {
@@ -324,14 +427,27 @@ func fileSize(path string) (int64, error) {
 // applyEvent dispatches a parsed rollout event to the right handler.
 // `st` is the per-session store handle owned by the tail goroutine.
 func applyEvent(w *Watcher, st *store.Store, sessionID string, ev Event) {
+	_ = applyEventScoped(w, st, sessionID, "", ev)
+}
+
+func applyEventScoped(w *Watcher, st *store.Store, sessionID, scope string, ev Event) string {
 	switch ev.Kind {
+	case KindSessionMeta:
+		// Rollout metadata is part of the historical stream being replayed,
+		// while the marker is only the current discovery/routing hint. Prefer
+		// rollout cwd when present so a current project switch cannot re-label
+		// older events from another project.
+		if ev.SessionMeta != nil && ev.SessionMeta.CwdPresent {
+			return store.ProjectKey(ev.SessionMeta.Cwd)
+		}
 	case KindToolCall:
-		w.handleToolCall(st, sessionID, ev.ToolCall)
+		w.handleToolCall(st, sessionID, scope, ev.ToolCall)
 	case KindToolResult:
 		w.handleToolResult(st, sessionID, ev.ToolResult)
 	case KindCompaction:
 		w.handleCompaction(st, sessionID, ev)
 	}
+	return scope
 }
 
 // pendingCall buffers an unmatched tool_call until its tool_result arrives.
@@ -344,11 +460,11 @@ type pendingCall struct {
 	StartedAt time.Time
 }
 
-func (w *Watcher) handleToolCall(st *store.Store, sessionID string, c *ToolCall) {
+func (w *Watcher) handleToolCall(st *store.Store, sessionID, scope string, c *ToolCall) {
 	if c == nil || c.CallID == "" {
 		return
 	}
-	canonical, hash := FingerprintToolCall(c.ToolName, c.ArgsJSON)
+	canonical, hash := FingerprintToolCallScoped(c.ToolName, c.ArgsJSON, scope)
 	label := LabelFromToolCall(c.ToolName, c.ArgsJSON)
 	callID := rolloutCallID(c.CallID)
 

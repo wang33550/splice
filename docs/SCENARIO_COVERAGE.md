@@ -20,6 +20,8 @@ The runtime contract is:
   earlier stable hit, explicitly marked as pre-compaction history.
 - If any known side-effect happened after the candidate hit, allow the repeat;
   stale restoration is more dangerous than duplicated work.
+- Unknown non-Bash host/MCP tools are treated as side-effect fences unless
+  explicitly classified as read-only by splice.
 - If a task was still running at compaction, notify rather than deny/ask; the
   model must verify whether the old task is still active before relaunching.
 - User-configured `never_cache_bash_patterns` can describe custom live/status
@@ -65,6 +67,8 @@ The runtime contract is:
 | F07 | Unknown Bash command | Conservative side-effect/fence | `TestClassifyBash` |
 | F08 | Terminal hit followed by real side-effect and then duplicate running same call | Real side-effect still fences; duplicate-running suppression must not bypass it | `TestPriorTerminalBehindRunningStillHonorsRealFence` |
 | F09 | Edit/side-effect before candidate terminal call | Earlier fence does not invalidate a later successful candidate result | `TestFenceBeforeCandidateDoesNotInvalidateLaterHit` |
+| F10 | Unknown non-Bash host/MCP tool after candidate terminal call | Conservative side-effect/fence; allow repeat and do not inject stale context | `TestUnknownToolAfterCandidateFencesHit`, `TestUnknownToolAfterStableCandidateFencesRuntimeHit` |
+| F11 | External read-only host tool after candidate terminal call | Does not fence stable local hit, but appears only as historical post-call context | `TestExternalReadOnlyToolAfterCandidateDoesNotFence` |
 
 ## Volatile External State
 
@@ -114,14 +118,20 @@ The runtime contract is:
 
 | ID | Scenario | Expected behavior | Current test |
 | --- | --- | --- | --- |
-| S01 | Different sessions same cwd | Isolated DBs and cache state | `TestCrossSessionIsolation`, `TestSessionsAreIsolatedByFile` |
+| S01 | Different sessions same cwd | Isolated DBs and cache state | `TestCrossSessionIsolation`, `TestSessionsAreIsolatedByFile`, `TestSameProjectDifferentConversationsAreIsolated` |
 | S02 | Cooldown scoped per session | No cross-session bleed | `TestCooldownIsScopedToSession` |
 | S03 | Fresh freeze replaces previous snapshot | Only latest snapshot is used | `TestSnapshotReplacedOnEachFreeze` |
 | S04 | No-hit eviction counter trips | Snapshot dropped and runtime hook stops injecting old context | `TestEvictionCounterTrips`, `TestRuntimeSnapshotEvictionDropsOldTrailAfterNoHits` |
 | S05 | Freeze resets eviction counter and cooldown window | Counter restarts at zero; next compacted repeat can intercept again | `TestFreezeResetsEvictionCounter`, `TestRuntimeCooldownClearsOnNextCompaction` |
-| S06 | `/clear` drops session DB and pending state | No stale cache after clear; late hash-only PostToolUse from pre-clear commands cannot resurrect old results; hash-only post-clear completion degrades to in-flight instead of trusting ambiguous output | `TestClearDropsSessionTrail`, `TestClearDropsLatePostToolUseWithoutPending`, `TestClearDropsHashOnlyPostToolUseEvenWithNewPending` |
+| S06 | `/clear` clears session trail and pending state | No stale cache after clear; late hash-only PostToolUse from pre-clear commands cannot resurrect old results; hash-only post-clear completion degrades to in-flight instead of trusting ambiguous output | `TestClearDropsSessionTrail`, `TestClearDropsLatePostToolUseWithoutPending`, `TestClearDropsHashOnlyPostToolUseEvenWithNewPending`, `TestClearTrailStateKeepsDBAndClearsRuntimeRows` |
 | S07 | Session marker write is private and valid JSON | Marker visible to watcher only | `TestSessionMarkerAndPendingFilesArePrivate` |
 | S08 | `/clear` with official `tool_use_id` pairing | Old pre-clear PostToolUse cannot claim a new same-hash pending row; new post-clear PostToolUse still records normally | `TestClearAllowsNewPostToolUseWithOfficialID`, `TestClearPreventsOldToolUseIDPostFromClaimingNewSameHashPending`, `TestCodexClearPreventsOldToolUseIDPostFromClaimingNewSameHashPending` |
+| S09 | Same desktop conversation switches project cwd | State follows `session_id` and is not split by cwd | `TestSessionStorageFollowsSessionAcrossDesktopProjectSwitch` |
+| S10 | Codex desktop projectless conversation | Global marker and session metadata are written without cwd | `TestCodexSessionStartUsesGlobalMarkerForProjectlessDesktopChat` |
+| S11 | Codex `/clear` while global watcher is alive | Clear writes a rollout offset barrier and watcher restarts that session tail from the post-clear offset | `TestCodexClearWritesRolloutOffsetBarrier`, `TestWatcherRestartsTailWhenClearMarkerAdvancesOffset` |
+| S12 | CLI one terminal with one conversation | SessionStart, tool result, compaction, and duplicate recovery all stay inside one session | `TestCliSingleTerminalSingleSessionFlow` |
+| S13 | CLI multiple terminals in the same project | Each terminal conversation has its own `session_id`, DB, cooldown, and recovered context | `TestCliMultipleTerminalsSameProjectDifferentSessions`, `TestGlobalWatcherCoversMultipleCliTerminalsInSameProject` |
+| S14 | Same desktop conversation repeats the same Bash command after switching projects | Storage still follows `session_id`, but command identity is scoped by project cwd so project A results are not reused in project B | `TestSameSessionDifferentProjectDoesNotReuseScopedBashResult`, `TestWatcherUsesRolloutCwdForHistoricalProjectScope` |
 
 ## Store And Persistence
 
@@ -132,7 +142,7 @@ The runtime contract is:
 | P03 | Append survives freeze | Frozen row is cacheable | `TestAppendLiveTrailSurvivesFreeze` |
 | P04 | Drop deletes DB/WAL/SHM/meta | Files removed | `TestDropClosesAndDeletesFiles` |
 | P05 | Watcher offset persists | Restart does not replay old bytes | `TestRolloutOffsetPersists` |
-| P06 | Session files and marker/pending sidecars are private | Mode is user-only where supported | `TestSessionMarkerAndPendingFilesArePrivate` |
+| P06 | Global session files and marker/pending sidecars are private | Mode is user-only where supported | `TestSessionMarkerAndPendingFilesArePrivate` |
 | P07 | Terminal cache hit returns later snapshot rows | Caller can restore full post-call context | `TestTerminalHitIncludesAfterEventsUntilCompaction` |
 | P08 | Legacy session DB lacks `pre_compact_trail.call_id` | OpenSession migrates schema without losing usable old snapshots | `TestOpenSessionMigratesPreCompactCallIDColumn` |
 
@@ -144,13 +154,21 @@ The runtime contract is:
 | W02 | Tail newly appended rollout lines | Store updates | `TestWatcherTailsNewLines` |
 | W03 | Marker removed | Tail stops and stale in-memory pending calls for that session are dropped | `TestWatcherCleansUpOnMarkerRemoval` |
 | W04 | Watcher-produced row can satisfy hook lookup | Cache hit is usable | `TestWatcherProducesUsableHits` |
-| W05 | Second watcher same cwd | Lock prevents duplicate ingestion | `TestWatcherSecondInstanceLocked` |
+| W05 | Second global watcher | Lock prevents duplicate ingestion | `TestWatcherSecondInstanceLocked` |
 | W06 | Stale lock | Reclaimed | `TestWatcherStaleLockReclaimed` |
 | W07 | Unknown rollout event | Skipped without crash | `TestParseHandlesUnknownEventGracefully` |
 | W08 | Rollout schema drift for tool call/result fields | Graceful skip or parse | `TestParseHandlesSchemaDriftAliases` |
 | W09 | Rollout tool_call persists immediately as running | Compaction can freeze in-flight work even before result exists | `TestWatcherInFlightAcrossCompactionEmitsRunningHit` |
 | W10 | Late rollout result after watcher restart | Result attaches via frozen call_id metadata, not volatile in-memory pending | `TestWatcherRestartCanAttachResultToFrozenRunningCall` |
 | W11 | Watcher shutdown | All in-memory pending call state is dropped | `TestWatcherShutdownDropsAllPending` |
+| W12 | One global watcher covers existing project, new project, and projectless sessions | Each active session is tailed and cached independently | `TestGlobalWatcherCoversMultipleProjectsAndProjectlessSessions` |
+| W13 | One global watcher covers multiple CLI terminals in the same cwd | Same-project rollout tails remain isolated by `session_id` | `TestGlobalWatcherCoversMultipleCliTerminalsInSameProject` |
+| W14 | Stored rollout offset is beyond current file size at watcher startup | Treat as truncation/rotation and replay current file from byte 0 | `TestWatcherInitialOffsetBeyondTruncatedRolloutReplaysFromStart` |
+| W15 | Rollout file shrinks while watcher is tailing | Drop in-memory pending state for that session and replay current file from byte 0 | `TestWatcherRunningTailHandlesRolloutTruncation` |
+| W16 | Tail goroutine exits while marker remains | Refresh detects stopped tail and restarts when rollout is available again | `TestWatcherRefreshRestartsExitedTail` |
+| W17 | Old active-session marker has no rollout file | Remove stale orphan marker after TTL; keep fresh markers for late rollout discovery | `TestWatcherRemovesStaleOrphanMarkerWithoutRollout`, `TestWatcherKeepsFreshMarkerWithoutRollout` |
+| W18 | Multiple rollout files match one session id | Choose the newest matching rollout file | `TestFindRolloutFileChoosesNewestMatch` |
+| W19 | A newer rollout file appears for an already-tailed session | Refresh restarts the tail on the newer file and replays it from a safe cursor | `TestWatcherRefreshSwitchesToNewerRolloutFile` |
 
 ## Installation And Config
 
@@ -161,6 +179,7 @@ The runtime contract is:
 | G03 | Malformed config | Error, hook falls back safely | `TestLoadMalformedJSONReturnsError`, `TestMalformedConfigFallsBackSafely` |
 | G04 | Empty config | Defaults | `TestLoadEmptyFileIsValid` |
 | G05 | Never-cache patterns load | Patterns available in runtime config | `TestLoadNeverCacheBashPatterns` |
+| G06 | Projectless desktop conversation with only global config | Global config still controls hook decisions | `TestProjectlessConversationUsesGlobalConfig` |
 | INST01 | Claude install creates hooks | Managed entries exist | `internal/install` tests |
 | INST02 | Claude uninstall removes only managed hooks | Unrelated hooks preserved | `internal/install` tests |
 | INST03 | Codex install creates hooks | Managed entries exist | `internal/codexinstall` tests |

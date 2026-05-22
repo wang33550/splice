@@ -10,8 +10,9 @@ compaction boundaries.
 - Codex with hooks enabled.
 - `splice` available on `PATH`, or a local splice binary that will not be moved
   after installation.
-- A running watcher in each project directory where you want Codex compaction
-  protection.
+- Hooks installed user-wide for desktop use, or project-local for a deliberately
+  scoped CLI/project setup. A single global watcher is auto-started by the Codex
+  SessionStart hook.
 
 If you build from source:
 
@@ -29,7 +30,20 @@ go build -o splice.exe ./cmd/splice
 
 ## Install Hooks
 
-Project-local installation is recommended:
+User-wide installation is recommended for Codex desktop:
+
+```bash
+splice install-codex-hooks --user
+```
+
+This writes `$CODEX_HOME/config.toml`, or `~/.codex/config.toml` when
+`CODEX_HOME` is not set. Desktop users should prefer this mode because the app
+can enter an existing project, create a new project, create a new conversation,
+or use a projectless chat before there is any project directory where a
+project-local splice command could have run.
+
+Project-local installation is also supported when you intentionally want splice
+only in one project:
 
 ```bash
 cd /path/to/your/project
@@ -38,68 +52,78 @@ splice install-codex-hooks --project
 
 This writes `<cwd>/.codex/config.toml`.
 
-User-wide installation:
-
-```bash
-splice install-codex-hooks --user
-```
-
-This writes `$CODEX_HOME/config.toml`, or `~/.codex/config.toml` when
-`CODEX_HOME` is not set.
-
 The installer is idempotent. It preserves unrelated config and rewrites only
 entries marked with `description = "splice-managed"`.
 
 ## Start The Watcher
 
-The watcher must stay running while Codex runs. It does not have to be visible,
-and it does not have to use a second terminal, but it must be a separate running
-process.
+In normal use you do not start the watcher yourself. `splice install-codex-hooks`
+registers `splice codex-session-start`; every Codex SessionStart event writes a
+global active-session marker and best-effort starts one background
+`splice codex-watch` process.
 
-The simplest option is two terminals.
+You do not need two terminals. In Codex desktop, open projects and conversations
+normally; the SessionStart hook is the front door that performs splice's
+background setup.
 
-Terminal 1, in the project directory:
+This is designed for Codex desktop:
+
+- Opening an existing project is covered when the session starts.
+- Creating a new project is covered when that new session starts.
+- Creating a new conversation inside the same project is covered as a separate
+  session.
+- Switching between project directories in the same desktop app is covered
+  because state is keyed by `session_id`, not by terminal cwd.
+- Projectless conversations are covered in a projectless session bucket.
+
+Command identity is still scoped by project `cwd`. A single desktop
+conversation can carry memory across project switches, but a repeated `npm test`
+in project B will not reuse the result of `npm test` from project A.
+
+The same model covers Codex CLI:
+
+- One terminal running one Codex conversation uses one `session_id` and one
+  session DB.
+- Multiple terminals can run multiple Codex conversations at the same time,
+  including in the same project directory. They share the single global watcher,
+  but each terminal's conversation stays isolated by `session_id`.
+
+Manual watcher start is optional and mainly useful for debugging or recovery:
 
 ```bash
 splice codex-watch
 ```
 
-Terminal 2, same project directory:
+The manual watcher is global. `--cwd` is accepted for old scripts but ignored.
+The auto-started watcher writes logs to `~/.splice/codex-watch.log`.
 
-```bash
-codex
-```
-
-One-terminal option for bash, zsh, or Git Bash:
-
-```bash
-mkdir -p .splice
-splice codex-watch > .splice/codex-watch.log 2>&1 &
-codex
-```
-
-One-terminal option for PowerShell:
-
-```powershell
-Start-Process -FilePath splice -ArgumentList @("codex-watch", "--cwd", (Get-Location).Path) -WindowStyle Hidden
-codex
-```
-
-The watcher is bound to the current working directory. If you use Codex in
-multiple projects at the same time, run one watcher per project. Multiple Codex
-sessions in the same project can share one watcher.
+Only one watcher should run per user account. If a second watcher starts while
+one is alive, the global lock prevents duplicate rollout ingestion.
 
 The watcher:
 
-1. Reads active session markers written by the SessionStart hook.
+1. Reads global active session markers written by the SessionStart hook.
 2. Locates the matching rollout JSONL under `$CODEX_HOME/sessions/...` or
    `~/.codex/sessions/...`.
 3. Replays existing events and tails new events.
 4. Freezes the trail when it sees a context-compaction event.
 
-If the watcher stops, new compactions are not protected until it is restarted.
-When restarted, it replays rollout files and rebuilds state as long as the
-rollout files still exist.
+If the watcher stops, new compactions are not protected until a later
+SessionStart starts it again or you run `splice codex-watch` manually. When
+restarted, it replays rollout files and rebuilds state as long as the rollout
+files still exist.
+
+The watcher is also defensive about normal file lifecycle edges:
+
+- If a rollout file is truncated or replaced, splice drops that session's
+  in-memory pending call map and replays the current file from byte 0.
+- If a watched rollout temporarily disappears and later comes back, the global
+  refresh loop restarts that session's tail.
+- If multiple rollout files match a session id, splice chooses the newest
+  matching file.
+- Fresh markers without a rollout are kept because Codex may create the file
+  shortly after SessionStart. Very old orphan markers with no rollout file are
+  removed automatically.
 
 ## Configuration
 
@@ -114,6 +138,10 @@ Global config:
 ```text
 ~/.splice/config.json
 ```
+
+Config is loaded as global defaults first, then project-local values override
+those defaults when Codex provides a project `cwd`. Projectless Codex desktop
+conversations use the global config only.
 
 Example:
 
@@ -130,6 +158,10 @@ asks before reusing the old result. Set it to `false` if you prefer automatic
 deny + context injection. In Codex bypass/full-auto modes, splice may
 automatically use deny + context injection because ask decisions can be swallowed
 by the host.
+
+For Codex desktop users, put broad defaults in `~/.splice/config.json`. Put
+project-specific live/status rules in `<project>/.splice/config.json` when that
+project has commands whose results should always be re-queried after compaction.
 
 ## Verify
 
@@ -148,14 +180,14 @@ Expected output when no compaction snapshot exists:
 Watcher smoke test:
 
 ```bash
-splice codex-watch --cwd "$(pwd)" --poll-ms 500
+splice codex-watch --poll-ms 500
 ```
 
 You should see diagnostics such as:
 
 ```text
-splice codex-watch: starting in /path/to/project
-splice codex-watch: tailing <session-id> -> .../rollout-...jsonl
+splice codex-watch: starting globally in /home/me/.splice
+splice codex-watch: tailing <session-id> [<project-key>] -> .../rollout-...jsonl
 ```
 
 ## /clear Behavior
@@ -172,25 +204,26 @@ new.
 ## Uninstall
 
 ```bash
-splice uninstall-codex-hooks --project
+splice uninstall-codex-hooks --user
 ```
 
 Or:
 
 ```bash
-splice uninstall-codex-hooks --user
+splice uninstall-codex-hooks --project
 ```
 
 Only splice-managed entries are removed. Unrelated Codex config is preserved.
 
 ## Known Limits
 
-- `splice codex-watch` is required. Hooks alone are not enough.
+- The global watcher is required. Hooks alone are not enough, but the Codex
+  SessionStart hook starts the watcher automatically.
 - `CODEX_HOME` must point to the same Codex home that contains rollout files if
   you use a non-default Codex home.
 - Codex rollout JSONL is not a public stable API. splice handles unknown events
   gracefully, but if Codex changes the compaction marker, watcher-based
   protection may need an update.
 - splice cannot see file changes made outside Codex.
-- Project-local state under `.splice/` can contain command output and should not
-  be committed or shared.
+- Runtime state under `~/.splice/` can contain command output and should not be
+  committed or shared.

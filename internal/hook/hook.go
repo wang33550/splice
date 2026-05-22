@@ -122,10 +122,10 @@ type CodexDecision struct {
 //   - "clear":   /clear inside a running session
 //   - "compact": fired after auto/manual compaction completes
 //
-// splice writes a "session marker" file for startup/resume so the codex-watch
-// daemon (or any other observer) can discover active sessions per cwd. On
-// "clear" we also wipe this session's trails because the model just lost
-// its memory and any cached results would mislead it.
+// splice writes a global "session marker" file for startup/resume so the
+// codex-watch daemon (or any other observer) can discover active sessions
+// across projects. On "clear" we also wipe this session's trails because the
+// model just lost its memory and any cached results would mislead it.
 type SessionStartInput struct {
 	SessionID      string `json:"session_id"`
 	HookEventName  string `json:"hook_event_name"`

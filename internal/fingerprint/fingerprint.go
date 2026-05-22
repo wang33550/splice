@@ -17,14 +17,25 @@ import (
 //   - empty strings, nil values, and empty objects/arrays are dropped
 //   - for Bash, only leading/trailing whitespace around "command" is trimmed
 func Compute(toolName string, args map[string]any) (string, string, error) {
+	return ComputeScoped(toolName, args, "")
+}
+
+// ComputeScoped is Compute plus an execution scope, normally store.ProjectKey(cwd).
+// Scope is part of semantic identity: `npm test` in project A is not the same
+// fact as `npm test` in project B, even inside one desktop conversation.
+func ComputeScoped(toolName string, args map[string]any, scope string) (string, string, error) {
 	normalized := normalize(args)
 	if toolName == "Bash" {
 		normalized = normalizeBash(normalized)
 	}
-	canonical, err := canonicalJSON(map[string]any{
+	payload := map[string]any{
 		"tool": toolName,
 		"args": normalized,
-	})
+	}
+	if strings.TrimSpace(scope) != "" {
+		payload["scope"] = strings.TrimSpace(scope)
+	}
+	canonical, err := canonicalJSON(payload)
 	if err != nil {
 		return "", "", err
 	}

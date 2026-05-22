@@ -9,7 +9,7 @@ splice records the pre-compaction causal trail through official hooks. If the
 post-compaction request is a safe duplicate, splice can restore the prior tool
 result instead of re-running it.
 
-Current release: `v0.5.0`.
+Current release: `v0.5.1`.
 
 ## Status
 
@@ -17,11 +17,12 @@ splice is ready for real project trials, but should be treated as beta software:
 
 - Claude Code support uses official PreToolUse / PostToolUse / PreCompact /
   SessionStart hooks.
-- Codex support uses official PreToolUse / PostToolUse / SessionStart hooks plus
-  `splice codex-watch` to detect compaction from Codex rollout files.
+- Codex support uses official PreToolUse / PostToolUse / SessionStart hooks.
+  Codex SessionStart auto-starts one global `splice codex-watch` process to
+  detect compaction from Codex rollout files.
 - All decisions are local and deterministic. splice does not call an LLM, send
   telemetry, or upload data.
-- Session data is stored under `<cwd>/.splice/` and may include command
+- Session data is stored under `~/.splice/` and may include command
   arguments and tool output. Do not commit or share that directory.
 
 ## What It Does
@@ -50,7 +51,7 @@ retriever. It only acts around compaction boundaries.
 From source:
 
 ```bash
-go install github.com/wang33550/splice/cmd/splice@v0.5.0
+go install github.com/wang33550/splice/cmd/splice@v0.5.1
 splice version
 ```
 
@@ -69,7 +70,8 @@ directly or let the installer write its absolute path into the hook config.
 
 ## Quickstart: Claude Code
 
-Install project-local hooks:
+Install hooks. Project-local is usually best when you only want splice in one
+repository:
 
 ```bash
 cd /path/to/your/project
@@ -88,46 +90,40 @@ Detailed guide: [docs/CLAUDE_INTEGRATION.md](docs/CLAUDE_INTEGRATION.md).
 
 ## Quickstart: Codex
 
-Install project-local hooks:
+Install user-wide hooks. This is the recommended Codex desktop setup because
+desktop users can open existing projects, create new projects, create new
+conversations, and use projectless chats without first running a command inside
+each project directory:
 
 ```bash
-cd /path/to/your/project
-splice install-codex-hooks --project
+splice install-codex-hooks --user
 ```
 
-Start the watcher in the same project directory. The watcher must stay running
-while Codex runs; a second terminal is the simplest option:
+After installation, Codex SessionStart auto-starts one background global watcher
+when Codex opens any session. This covers Codex desktop users who open an
+existing project, create a new project, create a new conversation, switch
+between project directories, or use a projectless conversation. It also covers
+CLI users who run one Codex session in one terminal or multiple Codex sessions
+in multiple terminals; each conversation is isolated by `session_id`, even when
+the terminals share the same project directory.
+
+Within a session, duplicate command identity is also scoped by project `cwd`.
+If a desktop conversation switches from project A to project B, `npm test` in B
+will not reuse the result of `npm test` from A.
+
+Manual watcher start is optional and mainly for debugging:
 
 ```bash
 splice codex-watch
 ```
 
-Then start Codex in another terminal:
-
-```bash
-codex
-```
-
-You can also run both from one terminal by putting the watcher in the
-background:
-
-```bash
-mkdir -p .splice
-splice codex-watch > .splice/codex-watch.log 2>&1 &
-codex
-```
-
-PowerShell:
-
-```powershell
-Start-Process -FilePath splice -ArgumentList @("codex-watch", "--cwd", (Get-Location).Path) -WindowStyle Hidden
-codex
-```
+The manual watcher is global too; it is not tied to the shell's current
+directory. Logs from the auto-started watcher go to `~/.splice/codex-watch.log`.
 
 Uninstall:
 
 ```bash
-splice uninstall-codex-hooks --project
+splice uninstall-codex-hooks --user
 ```
 
 Detailed guide: [docs/CODEX_INTEGRATION.md](docs/CODEX_INTEGRATION.md).
@@ -137,6 +133,10 @@ Detailed guide: [docs/CODEX_INTEGRATION.md](docs/CODEX_INTEGRATION.md).
 Project config: `<cwd>/.splice/config.json`
 
 Global config: `~/.splice/config.json`
+
+Config is loaded as global defaults first, then project config overrides those
+defaults when the host provides a `cwd`. Projectless Codex desktop chats use the
+global config only.
 
 ```json
 {
@@ -175,12 +175,14 @@ Scenario coverage is tracked in
 - splice cannot see file changes made outside the host agent, such as edits from
   an IDE, another terminal, or `git pull`. Keep `ask_on_intercept=true` if that
   happens in your workflow.
-- Codex protection requires `splice codex-watch`; hooks alone are not enough
-  because Codex does not expose a PreCompact hook.
+- Codex protection requires the global watcher because Codex does not expose a
+  PreCompact hook. The Codex SessionStart hook starts it automatically; if it is
+  stopped, run `splice codex-watch` manually.
 - Codex rollout parsing depends on private rollout JSONL shape and may need
-  updates if Codex changes it.
+  updates if Codex changes it. The watcher handles normal truncation,
+  replacement, restart, and stale-marker cleanup defensively.
 - Trail state is scoped to the current session and the latest compaction window.
-- `.splice/` can contain sensitive tool output and should stay local.
+- `~/.splice/` can contain sensitive tool output and should stay local.
 
 ## Development
 

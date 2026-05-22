@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -19,6 +20,19 @@ import (
 	"github.com/wang33550/splice/internal/install"
 	"github.com/wang33550/splice/internal/store"
 )
+
+func TestMain(m *testing.M) {
+	root, err := os.MkdirTemp("", "splice-main-test-*")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	_ = os.Setenv("SPLICE_HOME", root)
+	_ = os.Setenv("SPLICE_NO_AUTO_WATCH", "1")
+	code := m.Run()
+	_ = os.RemoveAll(root)
+	os.Exit(code)
+}
 
 // In v0.3, splice is dormant until PreCompact has fired for the session.
 // A repeat call before any compaction must be allowed and not produce
@@ -151,7 +165,7 @@ func TestRunInstallUninstallCodexHooksProject(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"codex-pre-tool-use", "codex-post-tool-use", "session-start"} {
+	for _, want := range []string{"codex-pre-tool-use", "codex-post-tool-use", "codex-session-start"} {
 		if !strings.Contains(string(raw), want) {
 			t.Fatalf("installed Codex config missing %q:\n%s", want, raw)
 		}
@@ -770,6 +784,33 @@ func TestGlobalNeverCacheBashPatternNotCached(t *testing.T) {
 	}
 }
 
+func TestProjectlessConversationUsesGlobalConfig(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("HOME", home)
+	if err := os.MkdirAll(filepath.Join(home, ".splice"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".splice", "config.json"), []byte(`{"ask_on_intercept": false}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	session := "sess-PROJECTLESS-GLOBAL-CONFIG"
+
+	runPreToolUseForTest(t, preToolUseJSON(t, "", session, "npm test"))
+	runPostToolUseForTest(t, postToolUseJSON(t, "", session, "npm test", map[string]any{
+		"exit_code": 0, "output": "12 passed",
+	}))
+	runPreCompactForTest(t, preCompactJSON(t, "", session))
+
+	got := runPreToolUseForTest(t, preToolUseJSON(t, "", session, "npm test"))
+	if got.HookSpecificOutput.PermissionDecision != "deny" {
+		t.Fatalf("projectless conversation should use global ask_on_intercept=false, got %+v", got.HookSpecificOutput)
+	}
+	if !strings.Contains(got.HookSpecificOutput.AdditionalContext, "12 passed") {
+		t.Fatalf("projectless global-config hit missing cached context:\n%s", got.HookSpecificOutput.AdditionalContext)
+	}
+}
+
 // Volatile read-only commands should not fence unrelated stable cache hits.
 // Example: after `npm test`, the model checks a live simulator status before
 // compaction. Repeating `npm test` is still eligible for reuse.
@@ -1064,6 +1105,62 @@ func TestCrossSessionIsolation(t *testing.T) {
 	}
 }
 
+func TestCliSingleTerminalSingleSessionFlow(t *testing.T) {
+	cwd := t.TempDir()
+	session := "sess-cli-single-terminal"
+
+	runSessionStartForTest(t, sessionStartJSON(t, cwd, session, "startup"))
+	runPreToolUseForTest(t, preToolUseJSON(t, cwd, session, "npm test"))
+	runPostToolUseForTest(t, postToolUseJSON(t, cwd, session, "npm test", map[string]any{
+		"exit_code": 0, "output": "single terminal ok",
+	}))
+	runPreCompactForTest(t, preCompactJSON(t, cwd, session))
+
+	got := runPreToolUseForTest(t, preToolUseJSON(t, cwd, session, "npm test"))
+	if got.HookSpecificOutput.PermissionDecision != "ask" {
+		t.Fatalf("single-terminal CLI session should recover duplicate command, got %+v", got.HookSpecificOutput)
+	}
+	if !strings.Contains(got.HookSpecificOutput.AdditionalContext, "single terminal ok") {
+		t.Fatalf("single-terminal cached context missing prior output:\n%s", got.HookSpecificOutput.AdditionalContext)
+	}
+}
+
+func TestCliMultipleTerminalsSameProjectDifferentSessions(t *testing.T) {
+	cwd := t.TempDir()
+
+	runSessionStartForTest(t, sessionStartJSON(t, cwd, "sess-cli-terminal-a", "startup"))
+	runPreToolUseForTest(t, preToolUseJSON(t, cwd, "sess-cli-terminal-a", "npm test"))
+	runPostToolUseForTest(t, postToolUseJSON(t, cwd, "sess-cli-terminal-a", "npm test", map[string]any{
+		"exit_code": 0, "output": "terminal A result",
+	}))
+	runPreCompactForTest(t, preCompactJSON(t, cwd, "sess-cli-terminal-a"))
+
+	runSessionStartForTest(t, sessionStartJSON(t, cwd, "sess-cli-terminal-b", "startup"))
+	runPreToolUseForTest(t, preToolUseJSON(t, cwd, "sess-cli-terminal-b", "npm test"))
+	runPostToolUseForTest(t, postToolUseJSON(t, cwd, "sess-cli-terminal-b", "npm test", map[string]any{
+		"exit_code": 0, "output": "terminal B result",
+	}))
+	runPreCompactForTest(t, preCompactJSON(t, cwd, "sess-cli-terminal-b"))
+
+	gotA := runPreToolUseForTest(t, preToolUseJSON(t, cwd, "sess-cli-terminal-a", "npm test"))
+	if gotA.HookSpecificOutput.PermissionDecision != "ask" {
+		t.Fatalf("terminal A should see its own snapshot, got %+v", gotA.HookSpecificOutput)
+	}
+	if !strings.Contains(gotA.HookSpecificOutput.AdditionalContext, "terminal A result") ||
+		strings.Contains(gotA.HookSpecificOutput.AdditionalContext, "terminal B result") {
+		t.Fatalf("terminal A context crossed session boundary:\n%s", gotA.HookSpecificOutput.AdditionalContext)
+	}
+
+	gotB := runPreToolUseForTest(t, preToolUseJSON(t, cwd, "sess-cli-terminal-b", "npm test"))
+	if gotB.HookSpecificOutput.PermissionDecision != "ask" {
+		t.Fatalf("terminal B should see its own snapshot, got %+v", gotB.HookSpecificOutput)
+	}
+	if !strings.Contains(gotB.HookSpecificOutput.AdditionalContext, "terminal B result") ||
+		strings.Contains(gotB.HookSpecificOutput.AdditionalContext, "terminal A result") {
+		t.Fatalf("terminal B context crossed session boundary:\n%s", gotB.HookSpecificOutput.AdditionalContext)
+	}
+}
+
 func TestClearDropsSessionTrail(t *testing.T) {
 	cwd := t.TempDir()
 	session := "sess-CLEAR"
@@ -1291,7 +1388,7 @@ func TestSessionMarkerAndPendingFilesArePrivate(t *testing.T) {
 	session := "sess-PRIVATE"
 
 	runSessionStartForTest(t, sessionStartJSON(t, cwd, session, "startup"))
-	markerPath := filepath.Join(cwd, ".splice", "active-sessions", session+".json")
+	markerPath := filepath.Join(store.ActiveSessionsDir(), store.SessionFileBase(session)+".json")
 	raw, err := os.ReadFile(markerPath)
 	if err != nil {
 		t.Fatal(err)
@@ -1305,7 +1402,7 @@ func TestSessionMarkerAndPendingFilesArePrivate(t *testing.T) {
 	}
 
 	runPreToolUseForTest(t, preToolUseJSON(t, cwd, session, "npm test"))
-	pendingEntries, err := os.ReadDir(pendingDir(cwd, session))
+	pendingEntries, err := os.ReadDir(pendingDir(session))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1316,10 +1413,87 @@ func TestSessionMarkerAndPendingFilesArePrivate(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		return
 	}
-	assertMode(t, filepath.Join(cwd, ".splice", "active-sessions"), 0o700)
+	assertMode(t, store.ActiveSessionsDir(), 0o700)
 	assertMode(t, markerPath, 0o600)
-	assertMode(t, pendingDir(cwd, session), 0o700)
-	assertMode(t, filepath.Join(pendingDir(cwd, session), pendingEntries[0].Name()), 0o600)
+	assertMode(t, pendingDir(session), 0o700)
+	assertMode(t, filepath.Join(pendingDir(session), pendingEntries[0].Name()), 0o600)
+}
+
+func TestCodexSessionStartUsesGlobalMarkerForProjectlessDesktopChat(t *testing.T) {
+	session := "sess-CODEX-PROJECTLESS"
+
+	runCodexSessionStartForTest(t, sessionStartJSON(t, "", session, "startup"))
+
+	markerPath := filepath.Join(store.ActiveSessionsDir(), store.SessionFileBase(session)+".json")
+	raw, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var marker SessionMarker
+	if err := json.Unmarshal(raw, &marker); err != nil {
+		t.Fatal(err)
+	}
+	if marker.SessionID != session || marker.Cwd != "" {
+		t.Fatalf("bad projectless marker: %+v", marker)
+	}
+	metaPath := store.SessionMetaPath(session)
+	if _, err := os.Stat(metaPath); err != nil {
+		t.Fatalf("projectless session meta should be written globally: %v", err)
+	}
+}
+
+func TestCodexClearWritesRolloutOffsetBarrier(t *testing.T) {
+	t.Setenv("SPLICE_NO_AUTO_WATCH", "1")
+	codexHome := t.TempDir()
+	t.Setenv("CODEX_HOME", codexHome)
+	cwd := t.TempDir()
+	session := "sess-CODEX-CLEAR-OFFSET"
+	rolloutDir := filepath.Join(codexHome, "sessions", "2026", "05", "22")
+	if err := os.MkdirAll(rolloutDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rolloutPath := filepath.Join(rolloutDir, "rollout-2026-05-22-"+session+".jsonl")
+	rollout := `{"timestamp":"2026-05-22T10:00:00Z","type":"session_meta","payload":{"session_id":"sess-CODEX-CLEAR-OFFSET","cwd":"/x"}}
+{"timestamp":"2026-05-22T10:00:01Z","type":"context_compaction"}
+`
+	if err := os.WriteFile(rolloutPath, []byte(rollout), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(rolloutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runCodexPreToolUseForTest(t, codexPreToolUseJSON(t, cwd, session, "npm test"))
+	runCodexPostToolUseForTest(t, codexPostToolUseJSON(t, cwd, session, "npm test", map[string]any{
+		"exit_code": 0, "output": "old should disappear",
+	}))
+	runPreCompactForTest(t, preCompactJSON(t, cwd, session))
+	runCodexSessionStartForTest(t, sessionStartJSON(t, cwd, session, "clear"))
+
+	st, err := store.OpenSession(session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	off, err := st.LastRolloutOffset()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off != info.Size() {
+		t.Fatalf("clear should persist rollout offset barrier %d, got %d", info.Size(), off)
+	}
+	cursorHash, err := st.LastRolloutCursorHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursorHash == "" {
+		t.Fatal("clear should persist rollout cursor hash barrier")
+	}
+	got := runCodexPreToolUseForTest(t, codexPreToolUseJSON(t, cwd, session, "npm test"))
+	if got.HookSpecificOutput.Decision != nil || got.HookSpecificOutput.AdditionalContext != "" {
+		t.Fatalf("clear should remove old cache hit, got %+v", got.HookSpecificOutput)
+	}
 }
 
 // In bypassPermissions mode the host swallows "ask", so splice must
@@ -1488,11 +1662,11 @@ func TestPostToolUseAfterCompactHonorsFenceBeforeResult(t *testing.T) {
 func TestCodexPreToolUseConsumesWatcherRecoveredLateResult(t *testing.T) {
 	cwd := t.TempDir()
 	session := "sess-CODEX-WATCHER-LATE"
-	canonical, hash, err := fingerprintForCodexTest("Bash", map[string]any{"command": "npm test"})
+	canonical, hash, err := fingerprintForCodexTest("Bash", map[string]any{"command": "npm test"}, cwd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := store.OpenSession(cwd, session)
+	st, err := store.OpenSession(session)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1547,6 +1721,34 @@ func TestCodexPreToolUseConsumesWatcherRecoveredLateResult(t *testing.T) {
 	}
 }
 
+func TestSameSessionDifferentProjectDoesNotReuseScopedBashResult(t *testing.T) {
+	projectA := t.TempDir()
+	projectB := t.TempDir()
+	session := "sess-DESKTOP-PROJECT-SWITCH-SCOPE"
+
+	runCodexPreToolUseForTest(t, codexPreToolUseJSON(t, projectA, session, "npm test"))
+	runCodexPostToolUseForTest(t, codexPostToolUseJSON(t, projectA, session, "npm test", map[string]any{
+		"exit_code": 0, "output": "project A result",
+	}))
+	runPreCompactForTest(t, preCompactJSON(t, projectA, session))
+
+	gotB := runCodexPreToolUseForTest(t, codexPreToolUseJSON(t, projectB, session, "npm test"))
+	if gotB.HookSpecificOutput.Decision != nil {
+		t.Fatalf("same command in a different project must not reuse project A result, got %+v", gotB.HookSpecificOutput)
+	}
+	if strings.Contains(gotB.HookSpecificOutput.AdditionalContext, "project A result") {
+		t.Fatalf("different-project repeat leaked old result:\n%s", gotB.HookSpecificOutput.AdditionalContext)
+	}
+
+	gotA := runCodexPreToolUseForTest(t, codexPreToolUseJSON(t, projectA, session, "npm test"))
+	if gotA.HookSpecificOutput.Decision == nil || gotA.HookSpecificOutput.Decision.Behavior != "ask" {
+		t.Fatalf("same project should still reuse the scoped result, got %+v", gotA.HookSpecificOutput)
+	}
+	if !strings.Contains(gotA.HookSpecificOutput.AdditionalContext, "project A result") {
+		t.Fatalf("same-project result missing from context:\n%s", gotA.HookSpecificOutput.AdditionalContext)
+	}
+}
+
 func TestCodexHookAndWatcherDoubleSourcePrefersTerminalResult(t *testing.T) {
 	cwd := t.TempDir()
 	session := "sess-CODEX-DOUBLE-SOURCE"
@@ -1561,11 +1763,11 @@ func TestCodexHookAndWatcherDoubleSourcePrefersTerminalResult(t *testing.T) {
 	// happen around compaction boundaries when both Codex hooks and codex-watch
 	// are enabled. The later running duplicate must not downgrade the same
 	// repeated operation to an in-flight warning after a terminal result exists.
-	canonical, hash, err := fingerprintForCodexTest("Bash", map[string]any{"command": "npm test"})
+	canonical, hash, err := fingerprintForCodexTest("Bash", map[string]any{"command": "npm test"}, cwd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := store.OpenSession(cwd, session)
+	st, err := store.OpenSession(session)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1603,11 +1805,11 @@ func TestCodexDoubleSourceSkipsDuplicateRunningButKeepsLaterContext(t *testing.T
 		"exit_code": 0, "output": "hook terminal result",
 	}))
 
-	canonical, hash, err := fingerprintForCodexTest("Bash", map[string]any{"command": "npm test"})
+	canonical, hash, err := fingerprintForCodexTest("Bash", map[string]any{"command": "npm test"}, cwd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := store.OpenSession(cwd, session)
+	st, err := store.OpenSession(session)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1810,6 +2012,32 @@ func TestNonCacheableToolsAlwaysAllow(t *testing.T) {
 	}
 }
 
+func TestUnknownToolAfterStableCandidateFencesRuntimeHit(t *testing.T) {
+	cwd := t.TempDir()
+	session := "sess-UNKNOWN-TOOL-FENCE"
+
+	runPreToolUseForTest(t, preToolUseJSON(t, cwd, session, "npm test"))
+	runPostToolUseForTest(t, postToolUseJSON(t, cwd, session, "npm test", map[string]any{
+		"exit_code": 0,
+		"output":    "ok",
+	}))
+	runPreToolUseForTest(t, preToolUseGenericJSON(t, cwd, session, "mcp__db__query", map[string]any{
+		"sql": "select refresh_materialized_view()",
+	}))
+	runPostToolUseForTest(t, postToolUseGenericJSON(t, cwd, session, "mcp__db__query", map[string]any{
+		"sql": "select refresh_materialized_view()",
+	}, map[string]any{"output": "refreshed"}))
+	runPreCompactForTest(t, preCompactJSON(t, cwd, session))
+
+	got := runPreToolUseForTest(t, preToolUseJSON(t, cwd, session, "npm test"))
+	if got.HookSpecificOutput.PermissionDecision != "" {
+		t.Fatalf("unknown tool after candidate should fence and allow repeat, got %+v", got.HookSpecificOutput)
+	}
+	if got.HookSpecificOutput.AdditionalContext != "" {
+		t.Fatalf("unknown tool fence should not inject stale context, got %q", got.HookSpecificOutput.AdditionalContext)
+	}
+}
+
 func runPreToolUseForTest(t *testing.T, input string) hook.PreToolUseOutput {
 	t.Helper()
 	out, err := runHookForTest(input, runPreToolUse)
@@ -1877,6 +2105,17 @@ func runSessionStartForTest(t *testing.T, input string) {
 	}
 	if strings.TrimSpace(out) != "" {
 		t.Fatalf("session-start should not emit stdout, got %q", out)
+	}
+}
+
+func runCodexSessionStartForTest(t *testing.T, input string) {
+	t.Helper()
+	out, err := runHookForTest(input, runCodexSessionStart)
+	if err != nil {
+		t.Fatalf("runCodexSessionStart: %v", err)
+	}
+	if strings.TrimSpace(out) != "" {
+		t.Fatalf("codex-session-start should not emit stdout, got %q", out)
 	}
 }
 
@@ -2149,8 +2388,8 @@ func assertMode(t *testing.T, path string, want os.FileMode) {
 	}
 }
 
-func fingerprintForCodexTest(toolName string, input map[string]any) (string, string, error) {
-	return fingerprint.Compute(toolName, input)
+func fingerprintForCodexTest(toolName string, input map[string]any, cwd string) (string, string, error) {
+	return fingerprint.ComputeScoped(toolName, input, store.ProjectKey(cwd))
 }
 
 func withTempCwd(t *testing.T, cwd string) {

@@ -148,3 +148,28 @@ func TestComputeNilArgsCanonicalizesToNull(t *testing.T) {
 		t.Fatalf("canonical = %q", canonical)
 	}
 }
+
+func TestComputeScopedAddsExecutionScope(t *testing.T) {
+	_, h1, err := ComputeScoped("Bash", map[string]any{"command": "npm test"}, "project-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, h2, err := ComputeScoped("Bash", map[string]any{"command": "npm test"}, "project-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h1 == h2 {
+		t.Fatal("same command in different execution scopes must not collide")
+	}
+	if !strings.Contains(canonical, `"scope":"project-b"`) {
+		t.Fatalf("canonical scope missing: %s", canonical)
+	}
+
+	_, h3, err := ComputeScoped("Bash", map[string]any{"command": "  npm test  "}, " project-b ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h2 != h3 {
+		t.Fatalf("scope and Bash outer whitespace should normalize: %q != %q", h2, h3)
+	}
+}

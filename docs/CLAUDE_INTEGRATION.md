@@ -25,7 +25,8 @@ go build -o splice.exe ./cmd/splice
 
 ## Install Hooks
 
-Project-local installation is recommended:
+Project-local installation is usually best when you only want splice in one
+repository:
 
 ```bash
 cd /path/to/your/project
@@ -88,31 +89,34 @@ Expected output when no compaction snapshot exists:
 
 ## Storage
 
-All project-local state is under `<cwd>/.splice/`:
+Runtime state is under `~/.splice/` (or `$SPLICE_HOME` when set). It is keyed by
+conversation `session_id`; cwd is stored as metadata for configuration/routing,
+not used as the ownership boundary:
 
 ```text
-.splice/
+~/.splice/
   sessions/
     <session-id>.db
     <session-id>.db-shm
     <session-id>.db-wal
     <session-id>.pending/
+    <session-id>.meta.json
   active-sessions/<session-id>.json
 ```
 
-The SQLite database can contain command arguments and tool output. Do not commit
-or share it.
+The SQLite database can contain command arguments and tool output. Do not share
+it.
 
 Reset local splice state:
 
 ```bash
-rm -rf .splice
+rm -rf ~/.splice
 ```
 
 PowerShell:
 
 ```powershell
-Remove-Item -LiteralPath .splice -Recurse -Force
+Remove-Item -LiteralPath "$HOME\.splice" -Recurse -Force
 ```
 
 ## Uninstall
@@ -134,6 +138,8 @@ are preserved.
 
 - Claude Code must be restarted after settings changes.
 - splice cannot see file changes made outside Claude Code.
+- Command identity is scoped by project `cwd`; the same command text in a
+  different project is treated as a different fact.
 - `/clear` should be treated as an explicit state boundary; do not assume the
   host always changes `session_id`.
 - Without `tool_use_id`, late PostToolUse events after `/clear` are ambiguous.

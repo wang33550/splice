@@ -4,6 +4,7 @@
 *.out
 coverage.out
 coverage
+splice_coverage
 dist/
 .splice/
 .DS_Store

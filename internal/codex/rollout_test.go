@@ -102,6 +102,93 @@ func TestFindRolloutFileMatchesByTrailingID(t *testing.T) {
 	}
 }
 
+func TestFindRolloutFileChoosesNewestMatch(t *testing.T) {
+	root := t.TempDir()
+	dateDir := filepath.Join(root, "sessions", "2026", "05", "19")
+	if err := os.MkdirAll(dateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldPath := filepath.Join(dateDir, "rollout-2026-05-19-abc123.jsonl")
+	newPath := filepath.Join(dateDir, "rollout-2026-05-20-abc123.jsonl")
+	if err := os.WriteFile(oldPath, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(newPath, []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().Add(-time.Hour)
+	newTime := time.Now()
+	if err := os.Chtimes(oldPath, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(newPath, newTime, newTime); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", root)
+
+	got, err := FindRolloutFile("abc123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != newPath {
+		t.Fatalf("got %q, want newest %q", got, newPath)
+	}
+}
+
+func TestFindRolloutFileDoesNotConfuseSessionIDSubstrings(t *testing.T) {
+	root := t.TempDir()
+	dateDir := filepath.Join(root, "sessions", "2026", "05", "19")
+	if err := os.MkdirAll(dateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sess1 := filepath.Join(dateDir, "rollout-2026-05-19-sess-1.jsonl")
+	sess10 := filepath.Join(dateDir, "rollout-2026-05-19-sess-10.jsonl")
+	if err := os.WriteFile(sess1, []byte(`{"type":"session_meta","payload":{"session_id":"sess-1"}}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sess10, []byte(`{"type":"session_meta","payload":{"session_id":"sess-10"}}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	oldTime := time.Now().Add(-time.Hour)
+	newTime := time.Now()
+	if err := os.Chtimes(sess1, oldTime, oldTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(sess10, newTime, newTime); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", root)
+
+	got, err := FindRolloutFile("sess-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != sess1 {
+		t.Fatalf("substring collision should choose exact session file, got %q want %q", got, sess1)
+	}
+}
+
+func TestFindRolloutFileAllowsFutureNameWhenMetaMatches(t *testing.T) {
+	root := t.TempDir()
+	dateDir := filepath.Join(root, "sessions", "2026", "05", "19")
+	if err := os.MkdirAll(dateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(dateDir, "future-prefix-sess-meta-extra.jsonl")
+	if err := os.WriteFile(target, []byte(`{"type":"session_meta","payload":{"session_id":"sess-meta"}}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", root)
+
+	got, err := FindRolloutFile("sess-meta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != target {
+		t.Fatalf("meta-verified future filename got %q want %q", got, target)
+	}
+}
+
 func TestFindRolloutFileMissing(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("CODEX_HOME", root)
@@ -284,6 +371,36 @@ func TestReadFromOffsetRejectsBadOffset(t *testing.T) {
 	p := writeSampleRollout(t)
 	if _, err := ReadFromOffset(p, -1); err == nil {
 		t.Fatal("expected negative offset seek error")
+	}
+}
+
+func TestCursorHashDetectsReplacementAtSameOffset(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "rollout.jsonl")
+	first := []byte("line one\nline two\n")
+	if err := os.WriteFile(p, first, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h1, err := CursorHash(p, int64(len(first)), 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h1 == "" {
+		t.Fatal("expected non-empty cursor hash")
+	}
+	replacement := []byte("LINE ONE\nLINE TWO\n")
+	if len(replacement) != len(first) {
+		t.Fatal("test replacement must keep same offset")
+	}
+	if err := os.WriteFile(p, replacement, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h2, err := CursorHash(p, int64(len(first)), 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h1 == h2 {
+		t.Fatal("cursor hash should change when file contents at same offset are replaced")
 	}
 }
 

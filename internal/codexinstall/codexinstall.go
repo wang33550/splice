@@ -12,7 +12,8 @@
 //	timeout = 30
 //
 // We register PreToolUse / PostToolUse / SessionStart hooks. PreCompact
-// doesn't exist in Codex — that's why we have codex-watch instead.
+// doesn't exist in Codex, so the Codex SessionStart hook also ensures the
+// global watcher is running in the background.
 package codexinstall
 
 import (
@@ -226,7 +227,7 @@ func mergeSpliceHooks(cfg map[string]any, binaryCommand string) map[string]any {
 
 	hooks["PreToolUse"] = mergeEntries(hooks["PreToolUse"], spliceMatcherEntry(binaryCommand+" codex-pre-tool-use"))
 	hooks["PostToolUse"] = mergeEntries(hooks["PostToolUse"], spliceMatcherEntry(binaryCommand+" codex-post-tool-use"))
-	hooks["SessionStart"] = mergeEntries(hooks["SessionStart"], spliceMatcherEntry(binaryCommand+" session-start"))
+	hooks["SessionStart"] = mergeEntries(hooks["SessionStart"], spliceMatcherEntry(binaryCommand+" codex-session-start"))
 
 	cfg["hooks"] = hooks
 	return cfg
@@ -329,6 +330,7 @@ func isSpliceManaged(e any) bool {
 		cmd, _ := hm["command"].(string)
 		if strings.Contains(cmd, "splice codex-pre-tool-use") ||
 			strings.Contains(cmd, "splice codex-post-tool-use") ||
+			strings.Contains(cmd, "splice codex-session-start") ||
 			strings.Contains(cmd, "splice session-start") {
 			return true
 		}

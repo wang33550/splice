@@ -6,12 +6,13 @@
 //	splice post-tool-use           reads PostToolUse stdin, records the tool result
 //	splice pre-compact             reads PreCompact stdin, freezes the trail
 //	splice post-compact            reads PostCompact stdin (no-op for now)
+//	splice codex-session-start     reads Codex SessionStart stdin, starts watcher
 //	splice install-claude-hooks    register splice in Claude Code's settings.json
 //	splice uninstall-claude-hooks  remove splice's entries from settings.json
 //	splice version                 prints version
 //
 // Storage: per-session SQLite WAL databases under
-// <workspace>/.splice/sessions/<session_id>.db.
+// ~/.splice/sessions/<session_id>.db.
 package main
 
 import (
@@ -29,6 +30,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -44,7 +46,7 @@ import (
 	"github.com/wang33550/splice/internal/store"
 )
 
-const version = "0.5.0"
+const version = "0.5.1"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -98,6 +100,10 @@ func main() {
 		if err := runSessionStart(); err != nil {
 			fmt.Fprintln(os.Stderr, "splice: warn:", err)
 		}
+	case "codex-session-start":
+		if err := runCodexSessionStart(); err != nil {
+			fmt.Fprintln(os.Stderr, "splice: warn:", err)
+		}
 	case "install-claude-hooks":
 		exit(runInstallClaudeHooks(os.Args[2:]))
 	case "uninstall-claude-hooks":
@@ -128,6 +134,7 @@ usage:
   splice pre-compact             < hook-stdin.json
   splice post-compact            < hook-stdin.json
   splice session-start           < hook-stdin.json
+  splice codex-session-start     < hook-stdin.json
   splice install-claude-hooks    [--user | --local]
   splice uninstall-claude-hooks  [--user | --local]
   splice install-codex-hooks     [--user | --project]
@@ -186,12 +193,12 @@ func runCodexPreToolUseWith(stdout io.Writer) error {
 	}
 
 	canonName := codexCanonicalToolName(in.ToolName)
-	canonical, hash, err := fingerprint.Compute(canonName, in.ToolInput)
+	canonical, hash, err := fingerprint.ComputeScoped(canonName, in.ToolInput, store.ProjectKey(in.Cwd))
 	if err != nil {
 		return fmt.Errorf("fingerprint: %w", err)
 	}
 
-	st, err := store.OpenSession(in.Cwd, in.SessionID)
+	st, err := store.OpenSession(in.SessionID)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
@@ -219,11 +226,11 @@ func runCodexPreToolUseWith(stdout io.Writer) error {
 		fmt.Fprintln(os.Stderr, "splice: warn: begin live_trail:", err)
 	}
 	if hostToolUseID == "" {
-		if err := writePendingID(in.Cwd, in.SessionID, hash, callID); err != nil {
+		if err := writePendingID(in.SessionID, hash, callID); err != nil {
 			fmt.Fprintln(os.Stderr, "splice: warn: stash pending id:", err)
 		}
 	} else {
-		clearPendingID(in.Cwd, in.SessionID, hash)
+		clearPendingID(in.SessionID, hash)
 	}
 
 	cfg, err := config.Load(in.Cwd)
@@ -274,7 +281,7 @@ func runCodexPreToolUseWith(stdout io.Writer) error {
 		if err := preserveInterceptedTerminalHit(st, callID, hit.Entry); err != nil {
 			fmt.Fprintln(os.Stderr, "splice: warn: preserve cache hit:", err)
 		}
-		clearPendingID(in.Cwd, in.SessionID, hash)
+		clearPendingID(in.SessionID, hash)
 	}
 	emitCodexHitDecision(&out, hit, in, cfg.AskOnIntercept)
 	return writeJSON(stdout, out)
@@ -295,12 +302,12 @@ func runCodexPostToolUse() error {
 	}
 
 	canonName := codexCanonicalToolName(in.ToolName)
-	canonical, hash, err := fingerprint.Compute(canonName, in.ToolInput)
+	canonical, hash, err := fingerprint.ComputeScoped(canonName, in.ToolInput, store.ProjectKey(in.Cwd))
 	if err != nil {
 		return fmt.Errorf("fingerprint: %w", err)
 	}
 
-	st, err := store.OpenSession(in.Cwd, in.SessionID)
+	st, err := store.OpenSession(in.SessionID)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
@@ -328,16 +335,16 @@ func runCodexPostToolUse() error {
 		} else if !store.IsErrNoRunningRow(err) {
 			return fmt.Errorf("append frozen terminal: %w", err)
 		}
-		if hasClearBarrier(in.Cwd, in.SessionID) {
+		if hasClearBarrier(in.SessionID) {
 			return nil
 		}
 	} else {
-		if hasClearBarrier(in.Cwd, in.SessionID) {
-			clearPendingID(in.Cwd, in.SessionID, hash)
+		if hasClearBarrier(in.SessionID) {
+			clearPendingID(in.SessionID, hash)
 			return nil
 		}
-		callID, _ = readPendingID(in.Cwd, in.SessionID, hash)
-		clearPendingID(in.Cwd, in.SessionID, hash)
+		callID, _ = readPendingID(in.SessionID, hash)
+		clearPendingID(in.SessionID, hash)
 	}
 
 	if callID != "" {
@@ -378,21 +385,19 @@ func codexCanonicalToolName(name string) string {
 
 func runCodexWatch(args []string) error {
 	fs := flag.NewFlagSet("codex-watch", flag.ContinueOnError)
-	cwd := fs.String("cwd", "", "workspace cwd to watch (default: current directory)")
+	cwd := fs.String("cwd", "", "deprecated; watcher is global and ignores cwd")
 	pollMs := fs.Int("poll-ms", 1000, "marker scan interval in milliseconds")
+	daemon := fs.Bool("daemon", false, "start a background global watcher and return")
 	fs.SetOutput(io.Discard)
 	if err := fs.Parse(args); err != nil {
 		return fmt.Errorf("codex-watch: %w", err)
 	}
-	if *cwd == "" {
-		var err error
-		*cwd, err = os.Getwd()
-		if err != nil {
-			return fmt.Errorf("codex-watch: resolve cwd: %w", err)
-		}
+	_ = cwd
+	if *daemon {
+		return ensureCodexWatcher()
 	}
 
-	w, err := codex.New(*cwd)
+	w, err := codex.New("")
 	if err != nil {
 		return err
 	}
@@ -403,6 +408,50 @@ func runCodexWatch(args []string) error {
 	ctx, cancel := signalContext()
 	defer cancel()
 	return w.Run(ctx)
+}
+
+func ensureCodexWatcher() error {
+	if watcherLockAlive() {
+		return nil
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("codex-watch daemon: locate executable: %w", err)
+	}
+	logPath := filepath.Join(store.HomeDir(), "codex-watch.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		return fmt.Errorf("codex-watch daemon: mkdir log dir: %w", err)
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("codex-watch daemon: open log: %w", err)
+	}
+	defer logFile.Close()
+	nullFile, err := os.Open(os.DevNull)
+	if err != nil {
+		return fmt.Errorf("codex-watch daemon: open null stdin: %w", err)
+	}
+	defer nullFile.Close()
+	proc, err := os.StartProcess(exe, []string{exe, "codex-watch"}, &os.ProcAttr{
+		Files: []*os.File{nullFile, logFile, logFile},
+		Env:   os.Environ(),
+	})
+	if err != nil {
+		return fmt.Errorf("codex-watch daemon: start: %w", err)
+	}
+	return proc.Release()
+}
+
+func watcherLockAlive() bool {
+	raw, err := os.ReadFile(store.WatcherLockPath())
+	if err != nil {
+		return false
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 0 {
+		return false
+	}
+	return codex.IsProcessAlive(pid)
 }
 
 // signalContext returns a context that's canceled on SIGINT / SIGTERM so
@@ -444,12 +493,12 @@ func runPreToolUseWith(stdout io.Writer) error {
 		HookSpecificOutput: hook.PreToolUseHookOutput{HookEventName: "PreToolUse"},
 	}
 
-	canonical, hash, err := fingerprint.Compute(in.ToolName, in.ToolInput)
+	canonical, hash, err := fingerprint.ComputeScoped(in.ToolName, in.ToolInput, store.ProjectKey(in.Cwd))
 	if err != nil {
 		return fmt.Errorf("fingerprint: %w", err)
 	}
 
-	st, err := store.OpenSession(in.Cwd, in.SessionID)
+	st, err := store.OpenSession(in.SessionID)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
@@ -477,11 +526,11 @@ func runPreToolUseWith(stdout io.Writer) error {
 		fmt.Fprintln(os.Stderr, "splice: warn: begin live_trail:", err)
 	}
 	if hostToolUseID == "" {
-		if err := writePendingID(in.Cwd, in.SessionID, hash, callID); err != nil {
+		if err := writePendingID(in.SessionID, hash, callID); err != nil {
 			fmt.Fprintln(os.Stderr, "splice: warn: stash pending id:", err)
 		}
 	} else {
-		clearPendingID(in.Cwd, in.SessionID, hash)
+		clearPendingID(in.SessionID, hash)
 	}
 
 	cfg, err := config.Load(in.Cwd)
@@ -533,7 +582,7 @@ func runPreToolUseWith(stdout io.Writer) error {
 		if err := preserveInterceptedTerminalHit(st, callID, hit.Entry); err != nil {
 			fmt.Fprintln(os.Stderr, "splice: warn: preserve cache hit:", err)
 		}
-		clearPendingID(in.Cwd, in.SessionID, hash)
+		clearPendingID(in.SessionID, hash)
 	}
 	emitHitDecision(&out, hit, in, cfg.AskOnIntercept)
 	return writeJSON(stdout, out)
@@ -780,12 +829,12 @@ func runPostToolUse() error {
 		return fmt.Errorf("decode stdin: %w", err)
 	}
 
-	canonical, hash, err := fingerprint.Compute(in.ToolName, in.ToolInput)
+	canonical, hash, err := fingerprint.ComputeScoped(in.ToolName, in.ToolInput, store.ProjectKey(in.Cwd))
 	if err != nil {
 		return fmt.Errorf("fingerprint: %w", err)
 	}
 
-	st, err := store.OpenSession(in.Cwd, in.SessionID)
+	st, err := store.OpenSession(in.SessionID)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
@@ -813,16 +862,16 @@ func runPostToolUse() error {
 		} else if !store.IsErrNoRunningRow(err) {
 			return fmt.Errorf("append frozen terminal: %w", err)
 		}
-		if hasClearBarrier(in.Cwd, in.SessionID) {
+		if hasClearBarrier(in.SessionID) {
 			return nil
 		}
 	} else {
-		if hasClearBarrier(in.Cwd, in.SessionID) {
-			clearPendingID(in.Cwd, in.SessionID, hash)
+		if hasClearBarrier(in.SessionID) {
+			clearPendingID(in.SessionID, hash)
 			return nil
 		}
-		callID, _ = readPendingID(in.Cwd, in.SessionID, hash)
-		clearPendingID(in.Cwd, in.SessionID, hash)
+		callID, _ = readPendingID(in.SessionID, hash)
+		clearPendingID(in.SessionID, hash)
 	}
 
 	// Sidecar found: try to finish the matching running row.
@@ -894,7 +943,7 @@ func runPreCompact() error {
 		return errors.New("pre-compact: missing session_id")
 	}
 
-	st, err := store.OpenSession(in.Cwd, in.SessionID)
+	st, err := store.OpenSession(in.SessionID)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
@@ -909,14 +958,20 @@ func runPreCompact() error {
 }
 
 // ---------------------------------------------------------------------
-// SessionStart: write a per-session marker so observers (codex-watch) can
-// discover active sessions, and on source=clear wipe this session's trails
-// since the model just lost its memory.
+// SessionStart: write a global per-session marker so observers (codex-watch)
+// can discover active sessions across desktop project switches, and on
+// source=clear wipe this session's trails since the model just lost memory.
 // ---------------------------------------------------------------------
 
-const markerDirName = "active-sessions"
-
 func runSessionStart() error {
+	return runSessionStartWithWatcher(false)
+}
+
+func runCodexSessionStart() error {
+	return runSessionStartWithWatcher(true)
+}
+
+func runSessionStartWithWatcher(autoWatch bool) error {
 	raw, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		return fmt.Errorf("read stdin: %w", err)
@@ -929,32 +984,65 @@ func runSessionStart() error {
 		return errors.New("session-start: missing session_id")
 	}
 
+	// On /clear: clear this session's trail state. Model just lost its
+	// memory; any cached results would mislead the now-amnesic model.
+	// Clearing in-place avoids deleting a DB file that the global watcher may
+	// have open concurrently. Do this before updating the marker so an active
+	// watcher restart sees the rollout offset barrier before it resumes tailing.
+	if in.Source == "clear" {
+		st, err := store.OpenSession(in.SessionID)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "splice: warn: open session for clear:", err)
+		} else {
+			if err := st.ClearTrailState(); err != nil {
+				fmt.Fprintln(os.Stderr, "splice: warn: clear session state:", err)
+			}
+			if off, cursorHash, err := currentCodexRolloutCursor(in.SessionID); err == nil && off > 0 {
+				if err := st.SetRolloutCursor(off, cursorHash); err != nil {
+					fmt.Fprintln(os.Stderr, "splice: warn: write clear rollout offset:", err)
+				}
+			}
+			_ = st.Close()
+		}
+		_ = os.RemoveAll(pendingDir(in.SessionID))
+		if err := writeClearBarrier(in.SessionID); err != nil {
+			fmt.Fprintln(os.Stderr, "splice: warn: write clear barrier:", err)
+		}
+		fmt.Fprintf(os.Stderr, "splice: dropped session %s (source=clear)\n", in.SessionID)
+	}
+
 	// Write/update the marker for every source — even "compact" — because the
 	// session is still alive and watchers should treat it as active. Only
 	// "stop" / process exit removes the marker (handled elsewhere).
 	if err := writeSessionMarker(in.Cwd, in); err != nil {
 		fmt.Fprintln(os.Stderr, "splice: warn: write marker:", err)
 	}
-
-	// On /clear: drop this session's entire DB file. Model just lost its
-	// memory; any cached results would mislead the now-amnesic model.
-	// Drop also clears the per-session pending sidecar dir.
-	if in.Source == "clear" {
-		dbPath := store.SessionDBPath(in.Cwd, in.SessionID)
-		if err := store.DropSessionFiles(dbPath); err != nil {
-			fmt.Fprintln(os.Stderr, "splice: warn: drop session files:", err)
+	if err := store.WriteSessionMeta(in.Cwd, in.SessionID); err != nil {
+		fmt.Fprintln(os.Stderr, "splice: warn: write session meta:", err)
+	}
+	if autoWatch && os.Getenv("SPLICE_NO_AUTO_WATCH") == "" {
+		if err := ensureCodexWatcher(); err != nil {
+			fmt.Fprintln(os.Stderr, "splice: warn: start codex watcher:", err)
 		}
-		_ = os.RemoveAll(pendingDir(in.Cwd, in.SessionID))
-		if err := writeClearBarrier(in.Cwd, in.SessionID); err != nil {
-			fmt.Fprintln(os.Stderr, "splice: warn: write clear barrier:", err)
-		}
-		fmt.Fprintf(os.Stderr, "splice: dropped session %s (source=clear)\n", in.SessionID)
 	}
 	return nil
 }
 
-func sessionMarkerDir(cwd string) string {
-	return filepath.Join(cwd, ".splice", markerDirName)
+func currentCodexRolloutCursor(sessionID string) (int64, string, error) {
+	rolloutPath, err := codex.FindRolloutFile(sessionID)
+	if err != nil {
+		return 0, "", err
+	}
+	info, err := os.Stat(rolloutPath)
+	if err != nil {
+		return 0, "", err
+	}
+	off := info.Size()
+	cursorHash, err := codex.CursorHash(rolloutPath, off, 4096)
+	if err != nil {
+		return 0, "", err
+	}
+	return off, cursorHash, nil
 }
 
 // SessionMarker is the on-disk shape of an active-session marker. JSON because
@@ -968,7 +1056,7 @@ type SessionMarker struct {
 }
 
 func writeSessionMarker(cwd string, in hook.SessionStartInput) error {
-	dir := sessionMarkerDir(cwd)
+	dir := store.ActiveSessionsDir()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
@@ -983,8 +1071,8 @@ func writeSessionMarker(cwd string, in hook.SessionStartInput) error {
 	if err != nil {
 		return err
 	}
-	tmp := filepath.Join(dir, in.SessionID+".tmp")
-	final := filepath.Join(dir, in.SessionID+".json")
+	tmp := filepath.Join(dir, store.SessionFileBase(in.SessionID)+".tmp")
+	final := filepath.Join(dir, store.SessionFileBase(in.SessionID)+".json")
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
 	}
@@ -1001,20 +1089,20 @@ func writeJSON(w io.Writer, v any) error {
 	return enc.Encode(v)
 }
 
-func pendingDir(cwd, sessionID string) string {
-	return filepath.Join(cwd, ".splice", "sessions", sessionID+".pending")
+func pendingDir(sessionID string) string {
+	return filepath.Join(store.SessionsDir(), store.SessionFileBase(sessionID)+".pending")
 }
 
-func writePendingID(cwd, sessionID, hash, callID string) error {
-	dir := pendingDir(cwd, sessionID)
+func writePendingID(sessionID, hash, callID string) error {
+	dir := pendingDir(sessionID)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	return os.WriteFile(filepath.Join(dir, hash), []byte(callID), 0o600)
 }
 
-func readPendingID(cwd, sessionID, hash string) (string, error) {
-	b, err := os.ReadFile(filepath.Join(pendingDir(cwd, sessionID), hash))
+func readPendingID(sessionID, hash string) (string, error) {
+	b, err := os.ReadFile(filepath.Join(pendingDir(sessionID), hash))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "", nil
@@ -1024,24 +1112,24 @@ func readPendingID(cwd, sessionID, hash string) (string, error) {
 	return strings.TrimSpace(string(b)), nil
 }
 
-func clearPendingID(cwd, sessionID, hash string) {
-	_ = os.Remove(filepath.Join(pendingDir(cwd, sessionID), hash))
+func clearPendingID(sessionID, hash string) {
+	_ = os.Remove(filepath.Join(pendingDir(sessionID), hash))
 }
 
-func clearBarrierPath(cwd, sessionID string) string {
-	return filepath.Join(cwd, ".splice", "sessions", sessionID+".cleared")
+func clearBarrierPath(sessionID string) string {
+	return filepath.Join(store.SessionsDir(), store.SessionFileBase(sessionID)+".cleared")
 }
 
-func writeClearBarrier(cwd, sessionID string) error {
-	dir := store.SessionsDir(cwd)
+func writeClearBarrier(sessionID string) error {
+	dir := store.SessionsDir()
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(clearBarrierPath(cwd, sessionID), []byte(time.Now().UTC().Format(time.RFC3339Nano)), 0o600)
+	return os.WriteFile(clearBarrierPath(sessionID), []byte(time.Now().UTC().Format(time.RFC3339Nano)), 0o600)
 }
 
-func hasClearBarrier(cwd, sessionID string) bool {
-	_, err := os.Stat(clearBarrierPath(cwd, sessionID))
+func hasClearBarrier(sessionID string) bool {
+	_, err := os.Stat(clearBarrierPath(sessionID))
 	return err == nil
 }
 
@@ -1177,13 +1265,13 @@ func runInstallCodexHooks(args []string) error {
 		scopeName = "project"
 	}
 	fmt.Fprintf(os.Stderr, "splice: %s codex config at %s (%s scope)\n", action, plan.ConfigPath, scopeName)
-	fmt.Fprintf(os.Stderr, "splice: hook command -> %s codex-pre-tool-use / codex-post-tool-use / session-start\n", plan.BinaryCommand)
+	fmt.Fprintf(os.Stderr, "splice: hook command -> %s codex-pre-tool-use / codex-post-tool-use / codex-session-start\n", plan.BinaryCommand)
 	if !plan.OnPath {
 		fmt.Fprintln(os.Stderr, "splice: tip: add the binary's directory to PATH so the hook command becomes 'splice':")
 		fmt.Fprintf(os.Stderr, "  export PATH=\"%s:$PATH\"   (bash/zsh)\n", filepath.Dir(plan.BinaryPath))
 		fmt.Fprintf(os.Stderr, "  $env:Path = \"%s;\" + $env:Path  (PowerShell)\n", filepath.Dir(plan.BinaryPath))
 	}
-	fmt.Fprintln(os.Stderr, "splice: now run `splice codex-watch &` in this directory to enable post-compact protection.")
+	fmt.Fprintln(os.Stderr, "splice: Codex SessionStart will auto-start the global watcher. For debugging, run `splice codex-watch` manually.")
 	return nil
 }
 

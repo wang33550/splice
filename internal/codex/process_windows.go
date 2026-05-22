@@ -12,6 +12,11 @@ import (
 // (treating a process as dead when it might be alive) only when the OS itself
 // can't enumerate it, which is the conservative direction.
 func isProcessAlive(pid int) bool {
+	return IsProcessAlive(pid)
+}
+
+// IsProcessAlive reports whether pid is currently running.
+func IsProcessAlive(pid int) bool {
 	const PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 	h, err := syscall.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
 	if err != nil {

@@ -2,16 +2,30 @@ package store
 
 import (
 	"database/sql"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
 
+func TestMain(m *testing.M) {
+	root, err := os.MkdirTemp("", "splice-store-test-*")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	_ = os.Setenv("SPLICE_HOME", root)
+	code := m.Run()
+	_ = os.RemoveAll(root)
+	os.Exit(code)
+}
+
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	cwd := t.TempDir()
-	st, err := OpenSession(cwd, "test-session")
+	st, err := OpenSession("test-session-" + t.Name())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -728,21 +742,88 @@ func TestNonCacheableToolMisses(t *testing.T) {
 	}
 }
 
+func TestUnknownToolAfterCandidateFencesHit(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Now()
+
+	if err := st.AppendLiveTrail(TrailEntry{
+		ToolName: "Bash", ArgsHash: "h-test",
+		ArgsJSON: `{"args":{"command":"npm test"},"tool":"Bash"}`, Label: "npm test",
+		Status: StatusOK, ExitCode: nullInt(0), Output: "ok",
+		RecordedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AppendLiveTrail(TrailEntry{
+		ToolName: "mcp__db__query", ArgsHash: "h-mcp",
+		ArgsJSON: `{}`, Label: "mcp__db__query",
+		Status: StatusOK, Output: "updated remote cache",
+		RecordedAt: now.Add(time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.FreezePreCompact(); err != nil {
+		t.Fatal(err)
+	}
+
+	hit, err := st.LookupCachedHit("h-test", func(command string) bool { return false }, func(command string) bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hit != nil {
+		t.Fatalf("unknown tool after candidate should fence old hit, got %+v", hit)
+	}
+}
+
+func TestExternalReadOnlyToolAfterCandidateDoesNotFence(t *testing.T) {
+	st := newTestStore(t)
+	now := time.Now()
+
+	if err := st.AppendLiveTrail(TrailEntry{
+		ToolName: "Bash", ArgsHash: "h-test",
+		ArgsJSON: `{"args":{"command":"npm test"},"tool":"Bash"}`, Label: "npm test",
+		Status: StatusOK, ExitCode: nullInt(0), Output: "ok",
+		RecordedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AppendLiveTrail(TrailEntry{
+		ToolName: "WebSearch", ArgsHash: "h-web",
+		ArgsJSON: `{}`, Label: "latest release",
+		Status: StatusOK, Output: "remote observation",
+		RecordedAt: now.Add(time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.FreezePreCompact(); err != nil {
+		t.Fatal(err)
+	}
+
+	hit, err := st.LookupCachedHit("h-test", func(command string) bool { return false }, func(command string) bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hit == nil {
+		t.Fatal("external read-only observation should not fence stable local hit")
+	}
+	if len(hit.AfterEvents) != 1 || hit.AfterEvents[0].ToolName != "WebSearch" {
+		t.Fatalf("expected WebSearch in restored trail, got %+v", hit.AfterEvents)
+	}
+}
+
 func TestSessionMetaPath(t *testing.T) {
-	cwd := t.TempDir()
-	want := filepath.Join(cwd, ".splice", "sessions", "s.meta.json")
-	if got := SessionMetaPath(cwd, "s"); got != want {
+	want := filepath.Join(HomeDir(), "sessions", "s.meta.json")
+	if got := SessionMetaPath("s"); got != want {
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 
 func TestOpenSessionMigratesPreCompactCallIDColumn(t *testing.T) {
-	cwd := t.TempDir()
 	session := "legacy"
-	if err := os.MkdirAll(SessionsDir(cwd), 0o700); err != nil {
+	if err := os.MkdirAll(SessionsDir(), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	dbPath := SessionDBPath(cwd, session)
+	dbPath := SessionDBPath(session)
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
@@ -788,7 +869,7 @@ VALUES
 		t.Fatal(err)
 	}
 
-	st, err := OpenSession(cwd, session)
+	st, err := OpenSession(session)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -877,8 +958,7 @@ func TestAppendLiveTrailSurvivesFreeze(t *testing.T) {
 // TestDropClosesAndDeletesFiles covers /clear: Drop should remove the .db,
 // its WAL/SHM siblings, and the meta sidecar.
 func TestDropClosesAndDeletesFiles(t *testing.T) {
-	cwd := t.TempDir()
-	st, err := OpenSession(cwd, "drop-me")
+	st, err := OpenSession("drop-me")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -902,17 +982,124 @@ func TestDropClosesAndDeletesFiles(t *testing.T) {
 	}
 }
 
+func TestClearTrailStateKeepsDBAndClearsRuntimeRows(t *testing.T) {
+	st := newTestStore(t)
+	if err := st.AppendLiveTrail(TrailEntry{
+		ToolName: "Bash", ArgsHash: "h",
+		ArgsJSON: `{}`, Label: "npm test",
+		Status: StatusOK, Output: "old",
+		RecordedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.FreezePreCompact(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AddCooldown("h"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetLastRolloutOffset(123); err != nil {
+		t.Fatal(err)
+	}
+
+	path := st.Path()
+	if err := st.ClearTrailState(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("clear should keep db file available: %v", err)
+	}
+	hit, err := st.LookupCachedHit("h", nil, func(string) bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hit != nil {
+		t.Fatalf("clear should remove cached hit, got %+v", hit)
+	}
+	cooled, err := st.IsInCooldown("h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cooled {
+		t.Fatal("clear should remove cooldown")
+	}
+	off, err := st.LastRolloutOffset()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off != 0 {
+		t.Fatalf("clear should remove old rollout offset before caller writes barrier offset, got %d", off)
+	}
+}
+
+func TestClearLiveTrailForRolloutResetKeepsSnapshotAndClearsCursor(t *testing.T) {
+	st := newTestStore(t)
+	if err := st.AppendLiveTrail(TrailEntry{
+		ToolName: "Bash", ArgsHash: "h-old",
+		ArgsJSON: `{}`, Label: "npm test",
+		Status: StatusOK, Output: "old snapshot",
+		RecordedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.FreezePreCompact(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AppendLiveTrail(TrailEntry{
+		ToolName: "Bash", ArgsHash: "h-live",
+		ArgsJSON: `{}`, Label: "go test",
+		Status: StatusOK, Output: "live row",
+		RecordedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetRolloutCursor(123, "cursor-hash"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.ClearLiveTrailForRolloutReset(); err != nil {
+		t.Fatal(err)
+	}
+	oldHit, err := st.LookupCachedHit("h-old", nil, func(string) bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oldHit == nil || oldHit.Entry.Output != "old snapshot" {
+		t.Fatalf("rollout reset should keep existing snapshot, got %+v", oldHit)
+	}
+	liveHit, err := st.LookupCachedHit("h-live", nil, func(string) bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if liveHit != nil {
+		t.Fatalf("rollout reset should clear live rows, got %+v", liveHit)
+	}
+	off, err := st.LastRolloutOffset()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off != 0 {
+		t.Fatalf("rollout reset should clear offset, got %d", off)
+	}
+	cursorHash, err := st.LastRolloutCursorHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursorHash != "" {
+		t.Fatalf("rollout reset should clear cursor hash, got %q", cursorHash)
+	}
+}
+
 // TestCooldownIsScopedToSession verifies that two different sessions in
 // the same cwd don't share cooldown state (per-session DB → per-session
 // cooldown by construction).
 func TestCooldownIsScopedToSession(t *testing.T) {
-	cwd := t.TempDir()
-	a, err := OpenSession(cwd, "A")
+	a, err := OpenSession("A")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer a.Close()
-	b, err := OpenSession(cwd, "B")
+	b, err := OpenSession("B")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1010,8 +1197,7 @@ func TestFreezeResetsEvictionCounter(t *testing.T) {
 
 // TestRolloutOffsetPersists verifies the watcher's offset round-trips.
 func TestRolloutOffsetPersists(t *testing.T) {
-	cwd := t.TempDir()
-	st, err := OpenSession(cwd, "S")
+	st, err := OpenSession("S")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1029,7 +1215,7 @@ func TestRolloutOffsetPersists(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	st2, err := OpenSession(cwd, "S")
+	st2, err := OpenSession("S")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1043,20 +1229,52 @@ func TestRolloutOffsetPersists(t *testing.T) {
 	}
 }
 
-// TestSessionsAreIsolatedByFile verifies that two sessions in the same
-// cwd genuinely live in different DB files (the new per-session model).
-func TestSessionsAreIsolatedByFile(t *testing.T) {
-	cwd := t.TempDir()
-	a, err := OpenSession(cwd, "A")
+func TestRolloutCursorPersists(t *testing.T) {
+	st, err := OpenSession("cursor-session")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.Path() != SessionDBPath(cwd, "A") {
+	if err := st.SetRolloutCursor(42, "abc123"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st2, err := OpenSession("cursor-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+	off, err := st2.LastRolloutOffset()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off != 42 {
+		t.Fatalf("offset = %d, want 42", off)
+	}
+	cursorHash, err := st2.LastRolloutCursorHash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursorHash != "abc123" {
+		t.Fatalf("cursor hash = %q, want abc123", cursorHash)
+	}
+}
+
+// TestSessionsAreIsolatedByFile verifies that two sessions genuinely live in
+// different DB files.
+func TestSessionsAreIsolatedByFile(t *testing.T) {
+	a, err := OpenSession("A")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Path() != SessionDBPath("A") {
 		t.Errorf("path mismatch: %s", a.Path())
 	}
 	defer a.Close()
 
-	b, err := OpenSession(cwd, "B")
+	b, err := OpenSession("B")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1070,5 +1288,74 @@ func TestSessionsAreIsolatedByFile(t *testing.T) {
 	}
 	if _, err := os.Stat(b.Path()); err != nil {
 		t.Errorf("B's DB file should exist on disk: %v", err)
+	}
+}
+
+func TestWriteSessionMetaAndProjectKey(t *testing.T) {
+	cwd := filepath.Join("C:", "Users", "HP", "Project")
+	sessionID := "meta/session:id"
+	if err := WriteSessionMeta(cwd, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(SessionMetaPath(sessionID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta SessionMeta
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		t.Fatal(err)
+	}
+	if meta.SessionID != sessionID || meta.Cwd != cwd {
+		t.Fatalf("bad meta: %+v", meta)
+	}
+	if meta.ProjectKey == "" || meta.ProjectKey == "_projectless" {
+		t.Fatalf("project cwd should produce stable project key, got %+v", meta)
+	}
+	if ProjectKey("") != "_projectless" {
+		t.Fatalf("blank cwd should be projectless, got %q", ProjectKey(""))
+	}
+	base := SessionFileBase(sessionID)
+	if strings.ContainsAny(base, `\/:`) {
+		t.Fatalf("session file base should be path-safe, got %q", base)
+	}
+}
+
+func TestSameProjectDifferentConversationsAreIsolated(t *testing.T) {
+	a, err := OpenSession("planning-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	b, err := OpenSession("planning-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	if err := a.AppendLiveTrail(TrailEntry{
+		ToolName: "Bash", ArgsHash: "h-shared",
+		ArgsJSON: `{"args":{"command":"npm test"},"tool":"Bash"}`,
+		Label:    "npm test", Status: StatusOK, Output: "A result",
+		RecordedAt: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.FreezePreCompact(); err != nil {
+		t.Fatal(err)
+	}
+
+	hitA, err := a.LookupCachedHit("h-shared", nil, func(string) bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hitA == nil || hitA.Entry.Output != "A result" {
+		t.Fatalf("session A should see its own result, got %+v", hitA)
+	}
+	hitB, err := b.LookupCachedHit("h-shared", nil, func(string) bool { return true })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hitB != nil {
+		t.Fatalf("session B must not see session A trail, got %+v", hitB)
 	}
 }
