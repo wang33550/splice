@@ -758,6 +758,115 @@ func TestConfiguredNeverCacheCannotUnfenceKnownSideEffect(t *testing.T) {
 	}
 }
 
+func TestConfiguredForceCacheUnknownStableCommand(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.MkdirAll(cwd+"/.splice", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cwd+"/.splice/config.json", []byte(`{"force_cache_bash_patterns": ["./run_eval --suite stable"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	session := "sess-CONFIG-FORCE-CACHE"
+	cmd := "./run_eval --suite stable"
+
+	runPreToolUseForTest(t, preToolUseJSON(t, cwd, session, cmd))
+	runPostToolUseForTest(t, postToolUseJSON(t, cwd, session, cmd, map[string]any{
+		"exit_code": 0, "output": "eval score=0.91",
+	}))
+	runPreCompactForTest(t, preCompactJSON(t, cwd, session))
+
+	got := runPreToolUseForTest(t, preToolUseJSON(t, cwd, session, cmd))
+	if got.HookSpecificOutput.PermissionDecision != "ask" {
+		t.Fatalf("configured stable unknown command should cache-hit, got %+v", got.HookSpecificOutput)
+	}
+	if !strings.Contains(got.HookSpecificOutput.AdditionalContext, "eval score=0.91") {
+		t.Fatalf("forced-cache context missing prior output:\n%s", got.HookSpecificOutput.AdditionalContext)
+	}
+}
+
+func TestConfiguredForceFenceOverridesBuiltinReadOnly(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.MkdirAll(cwd+"/.splice", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cwd+"/.splice/config.json", []byte(`{"force_fence_bash_patterns": ["pytest --update-snapshots"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	session := "sess-CONFIG-FORCE-FENCE"
+
+	runPreToolUseForTest(t, preToolUseJSON(t, cwd, session, "npm test"))
+	runPostToolUseForTest(t, postToolUseJSON(t, cwd, session, "npm test", map[string]any{
+		"exit_code": 0, "output": "12 passed",
+	}))
+	runPreToolUseForTest(t, preToolUseJSON(t, cwd, session, "pytest --update-snapshots"))
+	runPostToolUseForTest(t, postToolUseJSON(t, cwd, session, "pytest --update-snapshots", map[string]any{
+		"exit_code": 0, "output": "snapshots updated",
+	}))
+	runPreCompactForTest(t, preCompactJSON(t, cwd, session))
+
+	got := runPreToolUseForTest(t, preToolUseJSON(t, cwd, session, "npm test"))
+	if got.HookSpecificOutput.PermissionDecision != "" {
+		t.Fatalf("configured force-fence command must invalidate earlier stable hit, got %+v", got.HookSpecificOutput)
+	}
+
+	got = runPreToolUseForTest(t, preToolUseJSON(t, cwd, session, "pytest --update-snapshots"))
+	if got.HookSpecificOutput.PermissionDecision != "" {
+		t.Fatalf("configured force-fence command itself must not cache-hit, got %+v", got.HookSpecificOutput)
+	}
+}
+
+func TestConfiguredForceFenceWinsOverForceCache(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.MkdirAll(cwd+"/.splice", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cwd+"/.splice/config.json", []byte(`{
+		"force_cache_bash_patterns": ["./project_tool"],
+		"force_fence_bash_patterns": ["./project_tool"]
+	}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	session := "sess-CONFIG-FENCE-WINS"
+	cmd := "./project_tool"
+
+	runPreToolUseForTest(t, preToolUseJSON(t, cwd, session, cmd))
+	runPostToolUseForTest(t, postToolUseJSON(t, cwd, session, cmd, map[string]any{
+		"exit_code": 0, "output": "done",
+	}))
+	runPreCompactForTest(t, preCompactJSON(t, cwd, session))
+
+	got := runPreToolUseForTest(t, preToolUseJSON(t, cwd, session, cmd))
+	if got.HookSpecificOutput.PermissionDecision != "" {
+		t.Fatalf("force-fence should win over force-cache, got %+v", got.HookSpecificOutput)
+	}
+}
+
+func TestConfiguredForceCacheCannotOverrideKnownDangerousBash(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.MkdirAll(cwd+"/.splice", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cwd+"/.splice/config.json", []byte(`{"force_cache_bash_patterns": ["rm *", "git status && rm *"]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cases := []string{"rm scratch.txt", "git status && rm scratch.txt"}
+	for _, cmd := range cases {
+		t.Run(cmd, func(t *testing.T) {
+			session := "sess-CONFIG-DANGER-" + strings.ReplaceAll(strings.ReplaceAll(cmd, " ", "-"), "&", "and")
+			runPreToolUseForTest(t, preToolUseJSON(t, cwd, session, cmd))
+			runPostToolUseForTest(t, postToolUseJSON(t, cwd, session, cmd, map[string]any{
+				"exit_code": 0, "output": "danger happened",
+			}))
+			runPreCompactForTest(t, preCompactJSON(t, cwd, session))
+
+			got := runPreToolUseForTest(t, preToolUseJSON(t, cwd, session, cmd))
+			if got.HookSpecificOutput.PermissionDecision != "" {
+				t.Fatalf("known dangerous Bash must not be force-cached, got %+v", got.HookSpecificOutput)
+			}
+		})
+	}
+}
+
 func TestGlobalNeverCacheBashPatternNotCached(t *testing.T) {
 	cwd := t.TempDir()
 	home := t.TempDir()

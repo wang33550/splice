@@ -63,6 +63,33 @@ Restart Claude Code after changing hook settings.
 If Claude Code runs in a bypass mode where ask decisions are swallowed, splice
 automatically uses deny + injected context instead of ask.
 
+## Configuration
+
+Project config lives at `<cwd>/.splice/config.json`. Global defaults live at
+`~/.splice/config.json`; project config overrides global values when Claude
+Code provides a project `cwd`.
+
+```json
+{
+  "ask_on_intercept": true,
+  "snapshot_eviction_after": 20,
+  "never_cache_bash_patterns": ["./check_sim_status", "tail sim.log"],
+  "force_cache_bash_patterns": ["./run_eval --suite stable"],
+  "force_fence_bash_patterns": ["pytest --update-snapshots"]
+}
+```
+
+- Use `never_cache_bash_patterns` for live status checks such as simulator
+  progress files, queue state, process probes, and logs.
+- Use `force_cache_bash_patterns` for stable project commands splice cannot
+  classify by itself.
+- Use `force_fence_bash_patterns` for commands that look read-only but rewrite
+  snapshots, generated files, databases, or remote state.
+
+Safety priority is fixed: known dangerous Bash syntax and mutating prefixes
+win, then force-fence, then never-cache, then force-cache, then built-in
+classification.
+
 ## Verify
 
 1. Start Claude Code in the project.

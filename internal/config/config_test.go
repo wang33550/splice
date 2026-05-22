@@ -38,13 +38,17 @@ func TestLoadProjectLocalOverridesGlobal(t *testing.T) {
 	}
 }
 
-func TestLoadNeverCacheBashPatterns(t *testing.T) {
+func TestLoadBashPatternOverrides(t *testing.T) {
 	cwd := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(cwd, ".splice"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(cwd, ".splice", "config.json"),
-		[]byte(`{"never_cache_bash_patterns": ["./check_sim_status", "tail sim.log"]}`), 0o644); err != nil {
+		[]byte(`{
+			"never_cache_bash_patterns": ["./check_sim_status", "tail sim.log"],
+			"force_cache_bash_patterns": ["./run_eval --suite stable"],
+			"force_fence_bash_patterns": ["pytest --update-snapshots"]
+		}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -57,6 +61,12 @@ func TestLoadNeverCacheBashPatterns(t *testing.T) {
 	}
 	if r.NeverCacheBashPatterns[0] != "./check_sim_status" || r.NeverCacheBashPatterns[1] != "tail sim.log" {
 		t.Fatalf("unexpected patterns: %#v", r.NeverCacheBashPatterns)
+	}
+	if len(r.ForceCacheBashPatterns) != 1 || r.ForceCacheBashPatterns[0] != "./run_eval --suite stable" {
+		t.Fatalf("unexpected force-cache patterns: %#v", r.ForceCacheBashPatterns)
+	}
+	if len(r.ForceFenceBashPatterns) != 1 || r.ForceFenceBashPatterns[0] != "pytest --update-snapshots" {
+		t.Fatalf("unexpected force-fence patterns: %#v", r.ForceFenceBashPatterns)
 	}
 }
 

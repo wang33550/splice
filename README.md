@@ -9,7 +9,7 @@ splice records the pre-compaction causal trail through official hooks. If the
 post-compaction request is a safe duplicate, splice can restore the prior tool
 result instead of re-running it.
 
-Current release: `v0.5.1`.
+Current release: `v0.5.2`.
 
 ## Status
 
@@ -51,7 +51,7 @@ retriever. It only acts around compaction boundaries.
 From source:
 
 ```bash
-go install github.com/wang33550/splice/cmd/splice@v0.5.1
+go install github.com/wang33550/splice/cmd/splice@v0.5.2
 splice version
 ```
 
@@ -142,7 +142,9 @@ global config only.
 {
   "ask_on_intercept": true,
   "snapshot_eviction_after": 20,
-  "never_cache_bash_patterns": ["./check_sim_status", "tail sim.log"]
+  "never_cache_bash_patterns": ["./check_sim_status", "tail sim.log"],
+  "force_cache_bash_patterns": ["./run_eval --suite stable"],
+  "force_fence_bash_patterns": ["pytest --update-snapshots"]
 }
 ```
 
@@ -153,6 +155,17 @@ global config only.
   consecutive post-compaction tool calls do not hit it. Set `0` to disable.
 - `never_cache_bash_patterns`: project-specific live/status commands that
   should always re-run. Known dangerous commands still fence even if matched.
+- `force_cache_bash_patterns`: project-specific stable commands that splice
+  should treat as reusable even if the built-in classifier does not know them.
+- `force_fence_bash_patterns`: commands that should always invalidate older
+  cached facts and should never be restored as cached results.
+
+Pattern priority is safety-first: known dangerous Bash syntax and mutating
+prefixes win, then `force_fence_bash_patterns`, then
+`never_cache_bash_patterns`, then `force_cache_bash_patterns`, then the built-in
+classifier. Use `never_cache_bash_patterns` for live status files/logs and
+`force_fence_bash_patterns` for commands that look like tests but rewrite
+snapshots, generated files, databases, or remote state.
 
 ## Safety Model
 

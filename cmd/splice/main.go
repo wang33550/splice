@@ -46,7 +46,7 @@ import (
 	"github.com/wang33550/splice/internal/store"
 )
 
-const version = "0.5.1"
+const version = "0.5.2"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -617,7 +617,17 @@ func bashIsFenceWithConfig(cfg config.Resolved) func(string) bool {
 		if classify.IsKnownSideEffectBash(command) {
 			return true
 		}
+		for _, pattern := range cfg.ForceFenceBashPatterns {
+			if bashPatternMatches(pattern, command) {
+				return true
+			}
+		}
 		for _, pattern := range cfg.NeverCacheBashPatterns {
+			if bashPatternMatches(pattern, command) {
+				return false
+			}
+		}
+		for _, pattern := range cfg.ForceCacheBashPatterns {
 			if bashPatternMatches(pattern, command) {
 				return false
 			}
@@ -635,15 +645,31 @@ func bashIsCacheable(command string) bool {
 
 func bashCacheableFn(cfg config.Resolved) func(string) bool {
 	return func(command string) bool {
-		if !bashIsCacheable(command) {
+		if command == "" {
 			return false
+		}
+		if classify.IsKnownSideEffectBash(command) {
+			return false
+		}
+		for _, pattern := range cfg.ForceFenceBashPatterns {
+			if bashPatternMatches(pattern, command) {
+				return false
+			}
 		}
 		for _, pattern := range cfg.NeverCacheBashPatterns {
 			if bashPatternMatches(pattern, command) {
 				return false
 			}
 		}
-		return true
+		if bashIsCacheable(command) {
+			return true
+		}
+		for _, pattern := range cfg.ForceCacheBashPatterns {
+			if bashPatternMatches(pattern, command) {
+				return true
+			}
+		}
+		return false
 	}
 }
 

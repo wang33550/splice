@@ -31,6 +31,17 @@ type Config struct {
 	// results should always be re-queried after compaction. This is for live
 	// status checks such as simulator logs, queues, and process probes.
 	NeverCacheBashPatterns *[]string `json:"never_cache_bash_patterns,omitempty"`
+
+	// ForceCacheBashPatterns are project-specific Bash commands whose
+	// successful terminal results are stable enough to restore after
+	// compaction, even if splice's built-in classifier does not know them.
+	// Known dangerous shell syntax and mutating prefixes still win.
+	ForceCacheBashPatterns *[]string `json:"force_cache_bash_patterns,omitempty"`
+
+	// ForceFenceBashPatterns are project-specific Bash commands that should
+	// always invalidate earlier cached facts and should never be restored as
+	// cached results, even if they look read-only to the built-in classifier.
+	ForceFenceBashPatterns *[]string `json:"force_fence_bash_patterns,omitempty"`
 }
 
 // Resolved holds the post-default decision values.
@@ -38,6 +49,8 @@ type Resolved struct {
 	AskOnIntercept         bool
 	SnapshotEvictionAfter  int
 	NeverCacheBashPatterns []string
+	ForceCacheBashPatterns []string
+	ForceFenceBashPatterns []string
 }
 
 // Load reads user-global config first, overlays project-local config when cwd is
@@ -93,6 +106,12 @@ func mergeOver(base, top Config) Config {
 	if top.NeverCacheBashPatterns != nil {
 		base.NeverCacheBashPatterns = top.NeverCacheBashPatterns
 	}
+	if top.ForceCacheBashPatterns != nil {
+		base.ForceCacheBashPatterns = top.ForceCacheBashPatterns
+	}
+	if top.ForceFenceBashPatterns != nil {
+		base.ForceFenceBashPatterns = top.ForceFenceBashPatterns
+	}
 	return base
 }
 
@@ -117,6 +136,12 @@ func resolved(c Config) Resolved {
 	}
 	if c.NeverCacheBashPatterns != nil {
 		r.NeverCacheBashPatterns = append([]string(nil), (*c.NeverCacheBashPatterns)...)
+	}
+	if c.ForceCacheBashPatterns != nil {
+		r.ForceCacheBashPatterns = append([]string(nil), (*c.ForceCacheBashPatterns)...)
+	}
+	if c.ForceFenceBashPatterns != nil {
+		r.ForceFenceBashPatterns = append([]string(nil), (*c.ForceFenceBashPatterns)...)
 	}
 	return r
 }

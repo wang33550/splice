@@ -82,6 +82,10 @@ The runtime contract is:
 | V06 | Store-level cacheable callback rejects volatile Bash | Lookup misses despite successful row | `TestLookupCachedHitHonorsBashCacheableCallback` |
 | V07 | Configured unknown live/status query after stable command | Does not fence stable hit but is marked historical in terminal context | `TestConfiguredNeverCacheUnknownStatusDoesNotFenceStableHit` |
 | V08 | Configured pattern matches known side-effect command | Still fences; config cannot mark dangerous commands safe | `TestConfiguredNeverCacheCannotUnfenceKnownSideEffect` |
+| V09 | Project-configured unknown stable command | Can be restored after compaction when `force_cache_bash_patterns` marks it stable | `TestConfiguredForceCacheUnknownStableCommand` |
+| V10 | Project-configured command that looks read-only but mutates state | `force_fence_bash_patterns` invalidates earlier hits and prevents restoring the command itself | `TestConfiguredForceFenceOverridesBuiltinReadOnly` |
+| V11 | Same command matches both force-cache and force-fence | Force-fence wins; stale reuse is worse than duplicated work | `TestConfiguredForceFenceWinsOverForceCache` |
+| V12 | Force-cache matches known dangerous Bash or shell control syntax | Known danger still wins; config cannot turn side effects into cached facts | `TestConfiguredForceCacheCannotOverrideKnownDangerousBash` |
 
 ## Fingerprinting
 

@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.5.2 - 2026-05-22
+
+Added:
+
+- Project/global `force_cache_bash_patterns` for stable project-specific Bash
+  commands that splice's built-in classifier cannot know.
+- Project/global `force_fence_bash_patterns` for commands that look read-only
+  but mutate snapshots, generated files, databases, or remote state.
+- Scenario coverage for force-cache, force-fence, priority ordering, and the
+  guarantee that known dangerous Bash cannot be made cacheable by config.
+
+Changed:
+
+- Documented Bash pattern priority explicitly: known dangerous Bash syntax and
+  mutating prefixes win, then force-fence, then never-cache, then force-cache,
+  then built-in classification.
+
 ## v0.5.1 - 2026-05-22
 
 First beta release prepared for public GitHub use.

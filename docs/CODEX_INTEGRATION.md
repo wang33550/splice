@@ -149,7 +149,9 @@ Example:
 {
   "ask_on_intercept": true,
   "snapshot_eviction_after": 20,
-  "never_cache_bash_patterns": ["./check_sim_status", "tail sim.log"]
+  "never_cache_bash_patterns": ["./check_sim_status", "tail sim.log"],
+  "force_cache_bash_patterns": ["./run_eval --suite stable"],
+  "force_fence_bash_patterns": ["pytest --update-snapshots"]
 }
 ```
 
@@ -160,8 +162,18 @@ automatically use deny + context injection because ask decisions can be swallowe
 by the host.
 
 For Codex desktop users, put broad defaults in `~/.splice/config.json`. Put
-project-specific live/status rules in `<project>/.splice/config.json` when that
-project has commands whose results should always be re-queried after compaction.
+project-specific command rules in `<project>/.splice/config.json`:
+
+- Use `never_cache_bash_patterns` for live status checks such as simulator
+  progress files, queue state, process probes, and logs.
+- Use `force_cache_bash_patterns` for stable project commands splice cannot
+  classify by itself, such as deterministic eval or simulation summary commands.
+- Use `force_fence_bash_patterns` for commands that look read-only but rewrite
+  snapshots, generated files, databases, or remote state.
+
+Safety priority is fixed: known dangerous Bash syntax and mutating prefixes
+win, then force-fence, then never-cache, then force-cache, then built-in
+classification.
 
 ## Verify
 
