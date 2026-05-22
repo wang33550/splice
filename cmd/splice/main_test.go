@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -22,6 +24,13 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	if os.Getenv("SPLICE_TEST_EXIT_HELPER") != "" {
+		if os.Getenv("SPLICE_TEST_EXIT_ERROR") != "" {
+			exit(fmt.Errorf("boom"))
+		}
+		exit(nil)
+		return
+	}
 	root, err := os.MkdirTemp("", "splice-main-test-*")
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -32,6 +41,24 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 	_ = os.RemoveAll(root)
 	os.Exit(code)
+}
+
+func runExitForTest(err error) int {
+	args := []string{"-test.run=TestMain"}
+	cmd := exec.Command(os.Args[0], args...)
+	cmd.Env = append(os.Environ(), "SPLICE_TEST_EXIT_HELPER=1")
+	if err != nil {
+		cmd.Env = append(cmd.Env, "SPLICE_TEST_EXIT_ERROR=1")
+	}
+	runErr := cmd.Run()
+	if runErr == nil {
+		return 0
+	}
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	return -1
 }
 
 // In v0.3, splice is dormant until PreCompact has fired for the session.
@@ -217,6 +244,34 @@ func TestEmitAllowHelpers(t *testing.T) {
 	}
 	if cOut.HookSpecificOutput.HookEventName != "PreToolUse" || cOut.HookSpecificOutput.Decision != nil {
 		t.Fatalf("bad Codex allow output: %+v", cOut)
+	}
+}
+
+func TestUsageAndExitHelpers(t *testing.T) {
+	var stderr bytes.Buffer
+	oldStderr := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	usage()
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = oldStderr
+	if _, err := io.Copy(&stderr, r); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr.String(), "splice "+version) || !strings.Contains(stderr.String(), "install-codex-hooks") {
+		t.Fatalf("usage output missing expected content:\n%s", stderr.String())
+	}
+
+	if got := runExitForTest(nil); got != 0 {
+		t.Fatalf("exit(nil) code = %d, want 0", got)
+	}
+	if got := runExitForTest(fmt.Errorf("boom")); got != 1 {
+		t.Fatalf("exit(error) code = %d, want 1", got)
 	}
 }
 

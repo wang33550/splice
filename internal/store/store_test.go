@@ -1291,6 +1291,28 @@ func TestSessionsAreIsolatedByFile(t *testing.T) {
 	}
 }
 
+func TestRuntimePathHelpersUseSpliceHome(t *testing.T) {
+	home := HomeDir()
+	if home == "" {
+		t.Fatal("HomeDir should not be empty")
+	}
+	if got := SessionsDir(); got != filepath.Join(home, "sessions") {
+		t.Fatalf("SessionsDir = %q, want under home", got)
+	}
+	if got := ActiveSessionsDir(); got != filepath.Join(home, "active-sessions") {
+		t.Fatalf("ActiveSessionsDir = %q, want under home", got)
+	}
+	if got := WatcherLockPath(); got != filepath.Join(home, "codex-watch.lock") {
+		t.Fatalf("WatcherLockPath = %q, want under home", got)
+	}
+	if got := SessionDBPath("path/test:id"); !strings.HasPrefix(got, SessionsDir()) || !strings.HasSuffix(got, ".db") {
+		t.Fatalf("SessionDBPath should stay under sessions with db suffix, got %q", got)
+	}
+	if got := SessionMetaPath("path/test:id"); !strings.HasPrefix(got, SessionsDir()) || !strings.HasSuffix(got, ".meta.json") {
+		t.Fatalf("SessionMetaPath should stay under sessions with meta suffix, got %q", got)
+	}
+}
+
 func TestWriteSessionMetaAndProjectKey(t *testing.T) {
 	cwd := filepath.Join("C:", "Users", "HP", "Project")
 	sessionID := "meta/session:id"
